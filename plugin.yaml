@@ -1,0 +1,9 @@
+name: shiko-memory
+version: "0.1"
+description: Adaptive Cognitive Memory Engine
+manifest_version: 2
+api_version: 1
+license: MIT
+tags: [gateway, demo]
+config_schema:
+  api_url: { type: str, default: "", description: "Service endpoint" }
