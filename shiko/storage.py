@@ -31,7 +31,7 @@ from .envelope import SourceEnvelope
 from .errors import StorageError
 from .results import CaptureResult, Diagnostic, Severity
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_NAME = "shiko.db"
 
 # Columns every event read shares, so get_event() and list_events() cannot drift.
@@ -298,7 +298,66 @@ def _migration_3(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_1, _migration_2, _migration_3)
+def _migration_4(conn: sqlite3.Connection) -> None:
+    """Extraction runs and candidate rows, including rejections with reasons."""
+    for statement in (
+        """
+        CREATE TABLE IF NOT EXISTS extraction_runs (
+            run_id            TEXT PRIMARY KEY,
+            event_id          TEXT NOT NULL,
+            extractor         TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            prompt_version    TEXT,
+            model_id          TEXT,
+            status            TEXT NOT NULL,
+            error             TEXT,
+            calls             INTEGER NOT NULL DEFAULT 0,
+            tokens            INTEGER,
+            started_at        TEXT NOT NULL,
+            finished_at       TEXT,
+            detail_json       TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS extraction_runs_event ON extraction_runs (event_id, status)",
+        """
+        CREATE TABLE IF NOT EXISTS extraction_candidates (
+            candidate_id      TEXT PRIMARY KEY,
+            run_id            TEXT NOT NULL REFERENCES extraction_runs(run_id) ON DELETE CASCADE,
+            event_id          TEXT NOT NULL,
+            memory_id         TEXT,
+            extractor         TEXT NOT NULL,
+            extractor_version TEXT NOT NULL,
+            content           TEXT NOT NULL,
+            content_sha256    TEXT NOT NULL,
+            kind              TEXT NOT NULL,
+            epistemic         TEXT NOT NULL,
+            modality          TEXT NOT NULL,
+            scope             TEXT NOT NULL,
+            subject_kind      TEXT,
+            subject_id        TEXT,
+            span_start        INTEGER,
+            span_end          INTEGER,
+            negated           INTEGER NOT NULL DEFAULT 0,
+            quoted_speaker    TEXT,
+            confidence        REAL,
+            status            TEXT NOT NULL,
+            reason            TEXT,
+            created_at        TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS extraction_candidates_event ON extraction_candidates (event_id, status)",
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS extraction_candidates_unique
+            ON extraction_candidates (event_id, extractor_version, content_sha256, span_start, span_end)
+            WHERE status = 'accepted'
+        """,
+    ):
+        conn.execute(statement)
+
+
+MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    _migration_1, _migration_2, _migration_3, _migration_4,
+)
 
 
 class Store:

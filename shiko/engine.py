@@ -13,11 +13,12 @@ diagnostic rather than pretending to be empty.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,15 @@ from .envelope import (
     build_envelope,
 )
 from .errors import EngineClosedError, ShikoError, StorageError
+from .extraction import (
+    Candidate,
+    ExtractionError,
+    ExtractionResult,
+    GenerativeExtractor,
+    Rejection,
+    StructuredExtractor,
+    validate_candidate,
+)
 from .owner import OwnerManifest, ensure_manifest, slugify_owner
 from .pipeline import IngestionPipeline
 from .queue import complete_by_kind, failed_jobs, is_pending, pending_count
@@ -42,6 +52,7 @@ from .records import (
     EvidenceInput,
     MemoryDraft,
     RecordError,
+    artifacts_for_event,
     attach_artifact,
     create_memory,
     effective_activation_for,
@@ -67,7 +78,7 @@ from .results import (
     Severity,
     Status,
 )
-from .storage import DB_NAME, SCHEMA_VERSION, Store
+from .storage import DB_NAME, SCHEMA_VERSION, Store, new_id
 from .worker import Worker
 
 DEFAULT_OWNER = "hermes"
@@ -149,6 +160,7 @@ class Engine:
             coalesce_at=config.pipeline_coalesce_at,
             batch_size=config.pipeline_batch_size,
         )
+        self._extractor: object = StructuredExtractor()
 
     # -- construction -------------------------------------------------------
 
@@ -234,6 +246,16 @@ class Engine:
     @property
     def pipeline(self) -> IngestionPipeline:
         return self._pipeline
+
+    @property
+    def extractor(self) -> object:
+        return self._extractor
+
+    def set_extractor(self, extractor: object) -> None:
+        """Choose the extractor the pipeline and direct calls use."""
+        if not hasattr(extractor, "extract"):
+            raise TypeError("extractor must expose extract(event)")
+        self._extractor = extractor
 
     @property
     def store(self) -> Store:
@@ -369,6 +391,217 @@ class Engine:
     def memories(self, *, limit: int = 100) -> list[dict[str, Any]]:
         self._ensure_open()
         return list_memories(self._store, limit=limit)
+
+    # -- extraction ---------------------------------------------------------
+
+    def extract_event(
+        self, event_id: str, *, extractor: object | None = None,
+    ) -> ExtractionResult:
+        """Run one extractor over one source event and write validated candidates.
+
+        A failed extraction never removes or mutates the source event. A replay
+        of a succeeded (event, extractor, version) returns the existing memories
+        without calling the backend again.
+        """
+        self._ensure_open()
+        event = self._store.get_event(event_id)
+        if event is None:
+            raise RecordError("extraction references an unknown event", detail={"event_id": event_id})
+        active = extractor or self._extractor
+        name = str(getattr(active, "name", "structured"))
+        version = str(getattr(active, "version", "1"))
+
+        previous = self._store.read_one(
+            "SELECT run_id FROM extraction_runs WHERE event_id=? AND extractor=? AND extractor_version=? "
+            "AND status='succeeded' ORDER BY started_at LIMIT 1",
+            (event_id, name, version),
+        )
+        if previous is not None:
+            memory_ids = tuple(
+                row[0]
+                for row in self._store.read(
+                    "SELECT memory_id FROM extraction_candidates WHERE run_id=? "
+                    "AND status='accepted' AND memory_id IS NOT NULL ORDER BY created_at",
+                    (previous[0],),
+                )
+            )
+            return ExtractionResult(
+                run_id=str(previous[0]), event_id=event_id, extractor=name,
+                extractor_version=version, status="replayed", accepted=memory_ids,
+            )
+
+        run_id = new_id("run")
+        started = _utc_iso()
+        with self._store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO extraction_runs
+                    (run_id, event_id, extractor, extractor_version, status, calls, started_at, detail_json)
+                VALUES (?, ?, ?, ?, 'running', 0, ?, '{}')
+                """,
+                (run_id, event_id, name, version, started),
+            )
+        try:
+            outcome = active.extract(event)  # type: ignore[attr-defined]
+        except Exception as exc:
+            diagnostic = Diagnostic(
+                "extraction.failed", f"extractor failed: {exc}", Severity.ERROR,
+                {"event_id": event_id, "extractor": name, "extractor_version": version},
+            )
+            self._diagnostics.emit(diagnostic)
+            with self._store.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE extraction_runs
+                    SET status='failed', error=?, model_id=?, calls=?, tokens=?, finished_at=?
+                    WHERE run_id=?
+                    """,
+                    (
+                        str(exc)[:2000], _model_id(active), _calls(active), _tokens(active),
+                        _utc_iso(), run_id,
+                    ),
+                )
+            return ExtractionResult(
+                run_id=run_id, event_id=event_id, extractor=name, extractor_version=version,
+                status="failed", diagnostics=(diagnostic,), calls=_calls(active),
+            )
+
+        artifacts = artifacts_for_event(self._store, event_id)
+        accepted: list[str] = []
+        rejected: list[Rejection] = list(outcome.rejected)
+        model_id = (outcome.detail or {}).get("model_id") or _model_id(active)
+        for candidate in outcome.candidates:
+            reason = validate_candidate(event, candidate, artifacts=artifacts)
+            if reason is not None:
+                rejected.append(Rejection(candidate.content, reason))
+                continue
+            duplicate = self._store.read_one(
+                "SELECT memory_id FROM extraction_candidates WHERE event_id=? AND extractor_version=? "
+                "AND content_sha256=? AND span_start IS ? AND span_end IS ? AND status='accepted'",
+                (
+                    event_id, version, candidate.content_sha256(),
+                    candidate.span[0] if candidate.span else None,
+                    candidate.span[1] if candidate.span else None,
+                ),
+            )
+            if duplicate is not None:
+                if duplicate[0]:
+                    accepted.append(str(duplicate[0]))
+                continue
+
+            classifications = [
+                ClassificationInput("epistemic", candidate.epistemic, method=f"extractor:{name}", model_id=model_id),
+                ClassificationInput("modality", candidate.modality, method=f"extractor:{name}", model_id=model_id),
+                ClassificationInput("scope", candidate.scope, method=f"extractor:{name}", model_id=model_id),
+                ClassificationInput("extraction", name, method="deterministic", model_id=model_id),
+            ]
+            if candidate.negated:
+                classifications.append(ClassificationInput("polarity", "negated", method=f"extractor:{name}"))
+            if candidate.quoted_speaker:
+                classifications.append(
+                    ClassificationInput("attribution", candidate.quoted_speaker, method=f"extractor:{name}")
+                )
+            draft = MemoryDraft(
+                kind=candidate.kind,
+                content=candidate.content,
+                evidence=(EvidenceInput(event_id, "supports", candidate.span, independence_root=event_id),),
+                classifications=tuple(classifications),
+                subject_kind=candidate.subject_kind,
+                subject_id=candidate.subject_id,
+                event_time=_parse_iso(event["observed_at"]),
+                metadata={
+                    "extractor": name, "extractor_version": version, "run_id": run_id,
+                    "quoted_speaker": candidate.quoted_speaker, "negated": candidate.negated,
+                    "confidence": candidate.confidence,
+                },
+            )
+            memory = create_memory(self._store, draft, policy_version=f"extract:{name}.{version}")
+            memory_id = str(memory["memory_id"])
+            accepted.append(memory_id)
+            self._record_candidate(run_id, event_id, name, version, candidate, memory_id, None)
+
+        for rejection in rejected:
+            self._record_candidate(
+                run_id, event_id, name, version,
+                Candidate(content=rejection.content or "(empty)", kind="semantic"), None, rejection.reason,
+            )
+
+        detail = dict(outcome.detail or {})
+        detail.update({"accepted": len(accepted), "rejected": len(rejected)})
+        with self._store.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE extraction_runs
+                SET status='succeeded', prompt_version=?, model_id=?, calls=?, tokens=?,
+                    finished_at=?, detail_json=?
+                WHERE run_id=?
+                """,
+                (
+                    detail.get("prompt_version"), model_id, _calls(active), _tokens(active),
+                    _utc_iso(), json.dumps(detail, sort_keys=True), run_id,
+                ),
+            )
+        if rejected:
+            self._diagnostics.emit(Diagnostic(
+                "extraction.rejected", "some candidates were rejected", Severity.WARNING,
+                {"event_id": event_id, "count": len(rejected), "reasons": [r.reason for r in rejected]},
+            ))
+        return ExtractionResult(
+            run_id=run_id, event_id=event_id, extractor=name, extractor_version=version,
+            status="succeeded", accepted=tuple(accepted), rejected=tuple(rejected),
+            model_id=model_id, calls=_calls(active),
+        )
+
+    def _record_candidate(
+        self, run_id: str, event_id: str, extractor: str, version: str,
+        candidate: Candidate, memory_id: str | None, reason: str | None,
+    ) -> None:
+        with self._store.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO extraction_candidates
+                    (candidate_id, run_id, event_id, memory_id, extractor, extractor_version,
+                     content, content_sha256, kind, epistemic, modality, scope, subject_kind,
+                     subject_id, span_start, span_end, negated, quoted_speaker, confidence,
+                     status, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id("cand"), run_id, event_id, memory_id, extractor, version,
+                    candidate.content, candidate.content_sha256(), candidate.kind,
+                    candidate.epistemic, candidate.modality, candidate.scope,
+                    candidate.subject_kind, candidate.subject_id,
+                    candidate.span[0] if candidate.span else None,
+                    candidate.span[1] if candidate.span else None,
+                    int(candidate.negated), candidate.quoted_speaker, candidate.confidence,
+                    "accepted" if memory_id else "rejected", reason, _utc_iso(),
+                ),
+            )
+
+    def extraction_runs(self, *, event_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        self._ensure_open()
+        if event_id is None:
+            rows = self._store.read(
+                "SELECT run_id, event_id, extractor, extractor_version, status, model_id, calls, "
+                "error, started_at, detail_json FROM extraction_runs ORDER BY started_at DESC LIMIT ?",
+                (int(limit),),
+            )
+        else:
+            rows = self._store.read(
+                "SELECT run_id, event_id, extractor, extractor_version, status, model_id, calls, "
+                "error, started_at, detail_json FROM extraction_runs WHERE event_id=? "
+                "ORDER BY started_at DESC LIMIT ?",
+                (event_id, int(limit)),
+            )
+        return [
+            {
+                "run_id": row[0], "event_id": row[1], "extractor": row[2],
+                "extractor_version": row[3], "status": row[4], "model_id": row[5],
+                "calls": int(row[6]), "error": row[7], "started_at": row[8],
+                "detail": json.loads(row[9] or "{}"),
+            }
+            for row in rows
+        ]
 
     def attach_artifact(
         self, event_id: str, source: str | Path | bytes, *, media_type: str, name: str = "",
@@ -675,3 +908,28 @@ class Engine:
     def _ensure_open(self) -> None:
         if self._closed:
             raise EngineClosedError("engine is closed", detail={"root": str(self._root)})
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _calls(extractor: object) -> int:
+    backend = getattr(extractor, "backend", None)
+    return int(getattr(backend, "calls", 0) or 0)
+
+
+def _tokens(extractor: object) -> int | None:
+    backend = getattr(extractor, "backend", None)
+    tokens = getattr(backend, "tokens", None)
+    return int(tokens) if isinstance(tokens, int) else None
+
+
+def _model_id(extractor: object) -> str | None:
+    backend = getattr(extractor, "backend", None)
+    model = getattr(backend, "model_id", None)
+    return str(model) if model else None

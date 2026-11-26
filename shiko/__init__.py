@@ -35,6 +35,15 @@ from .records import (
     MemoryDraft,
     RecordError,
 )
+from .extraction import (
+    Candidate,
+    ExtractionError,
+    ExtractionResult,
+    GenerativeExtractor,
+    Rejection,
+    StructuredExtractor,
+)
+from .backends import OpenAIBackend, RecordedBackend, backend_from_env
 from .results import (
     CaptureResult,
     CloseResult,
@@ -76,6 +85,15 @@ __all__ = [
     "RecordError",
     "Worker",
     "IngestionPipeline",
+    "Candidate",
+    "ExtractionError",
+    "ExtractionResult",
+    "GenerativeExtractor",
+    "Rejection",
+    "StructuredExtractor",
+    "OpenAIBackend",
+    "RecordedBackend",
+    "backend_from_env",
     # results
     "Result",
     "Status",
