@@ -1,0 +1,28 @@
+# Copy to ~/.config/shiko/config.toml (or point SHIKO_CONFIG at it).
+# Keys are never written here; put them in the environment or an env_file.
+
+[llm]
+# opencode (default), openrouter, or custom
+provider = "opencode"
+model = "qwen3.8-flash"
+temperature = 0.3
+max_tokens = 1600
+timeout = 90
+
+# Optional: read KEY=VALUE pairs when your shell has not exported them.
+# env_file = "~/.hermes/.env"
+
+# Optional: switch providers by uncommenting this block instead.
+# provider = "openrouter"
+# model = "qwen/qwen3.8-flash"
+
+# Optional: disable a reasoning model's thinking so the completion budget
+# goes to the JSON answer.
+# reasoning_effort = "none"
+#
+# [llm.extra_body]
+# thinking = { type = "disabled" }
+
+# Optional: override or add request headers.
+# [llm.headers]
+# x-opencode-session = "shiko-local"

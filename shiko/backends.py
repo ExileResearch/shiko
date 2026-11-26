@@ -13,7 +13,7 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class BackendError(RuntimeError):
@@ -68,18 +68,25 @@ class OpenAIBackend:
     temperature: float = 0.6
     max_tokens: int = 900
     extra_headers: dict[str, str] = field(default_factory=dict)
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    reasoning_effort: str | None = None
     name: str = "openai-compatible"
     calls: int = 0
     tokens: int | None = None
+    timeout: float = 90.0
 
-    def complete(self, prompt: str, *, timeout: float = 30.0) -> str:
+    def complete(self, prompt: str, *, timeout: float | None = None) -> str:
         url = self.base_url.rstrip("/") + "/chat/completions"
-        body = json.dumps({
+        payload: dict[str, Any] = {
             "model": self.model_id,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-        }).encode("utf-8")
+        }
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        payload.update(self.extra_body)
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             url,
             data=body,
@@ -93,9 +100,10 @@ class OpenAIBackend:
             method="POST",
         )
         self.calls += 1
+        effective_timeout = self.timeout if timeout is None else timeout
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(request, timeout=effective_timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise BackendError(f"backend HTTP {exc.code}: {detail}", code="backend.http") from exc
@@ -108,21 +116,29 @@ class OpenAIBackend:
         except ValueError as exc:
             raise BackendError(f"backend returned invalid JSON: {exc}", code="backend.malformed") from exc
         try:
-            choice = payload["choices"][0]["message"]["content"]
+            choice = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise BackendError("backend response has no message content", code="backend.malformed") from exc
-        usage = payload.get("usage") or {}
+        usage = data.get("usage") or {}
         if isinstance(usage.get("total_tokens"), int):
             self.tokens = usage["total_tokens"]
-        return str(choice)
+        if not isinstance(choice, str) or not choice.strip():
+            raise BackendError(
+                "backend returned empty content (a reasoning model may have spent the "
+                "completion budget; raise max_tokens or disable thinking)",
+                code="backend.empty",
+            )
+        return choice
 
 
 def backend_from_env() -> OpenAIBackend | None:
-    """Build a backend from ``SHIKO_LLM_*``; ``None`` when unconfigured."""
-    base_url = os.environ.get("SHIKO_LLM_BASE_URL", "").strip()
-    api_key = os.environ.get("SHIKO_LLM_API_KEY", "").strip()
-    model = os.environ.get("SHIKO_LLM_MODEL", "").strip()
-    if not (base_url and api_key and model):
+    """Build a backend from ``SHIKO_LLM_*``/config; ``None`` when incomplete."""
+    from .llm_config import ConfigError, build_backend, load_settings
+
+    try:
+        settings = load_settings()
+        if not settings.api_key:
+            return None
+        return build_backend(settings)
+    except ConfigError:
         return None
-    temperature = float(os.environ.get("SHIKO_LLM_TEMPERATURE", "0.6") or 0.6)
-    return OpenAIBackend(base_url=base_url, api_key=api_key, model_id=model, temperature=temperature)

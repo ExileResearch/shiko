@@ -44,6 +44,12 @@ from .extraction import (
     StructuredExtractor,
 )
 from .backends import OpenAIBackend, RecordedBackend, backend_from_env
+from .llm_config import (
+    ConfigError,
+    LLMSettings,
+    build_backend,
+    load_settings,
+)
 from .results import (
     CaptureResult,
     CloseResult,
@@ -94,6 +100,10 @@ __all__ = [
     "OpenAIBackend",
     "RecordedBackend",
     "backend_from_env",
+    "ConfigError",
+    "LLMSettings",
+    "build_backend",
+    "load_settings",
     # results
     "Result",
     "Status",
