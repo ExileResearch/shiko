@@ -3,3 +3,26 @@
 
 .VSCodeCounter/
 notes/
+
+# Build and test outputs
+build/
+dist/
+*.egg-info/
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data roots
+.shiko/
+shiko.db
+*.db-wal
+*.db-shm
+logs/shiko.jsonl
+
+# Editor and OS noise
+.DS_Store
+.idea/

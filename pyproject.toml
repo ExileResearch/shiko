@@ -1,5 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "shiko-memory"
-version = "1.0.0"
-requires-python = "≧ 3.11"
+dynamic = ["version"]
+description = "Adaptive cognitive memory engine for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Exile Research" }]
+keywords = ["memory", "agent", "recall", "provenance", "sqlite"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The core is deliberately dependency-free: stdlib only, so ordinary Python and any
+# host interpreter (including the one Hermes runs) can import it. Optional backends
+# arrive in later milestones behind extras.
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=8"]
+
+[project.urls]
+Repository = "https://github.com/exileresearch/shiko"
+
+# A pip-installed copy registers itself as a Hermes memory provider. The git plugin
+# install is the supported path; this entry point is the equivalent for wheels.
+[project.entry-points."hermes_agent.memory_providers"]
+shiko = "shiko.adapters.hermes:provider"
+
+[tool.setuptools]
+packages = ["shiko", "shiko.adapters"]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = { attr = "shiko._version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "host: exercises a real Hermes installation (set SHIKO_LIVE=1 to enable)",
+    "slow: builds and installs distributions into fresh interpreters",
+]

@@ -1,16 +1,32 @@
-"""Minimal Hermes plugin — registers a tool and a hook."""
+"""Hermes plugin entry point for Shiko.
 
-import json
+This file is the plugin door, not the library. It only exists so Hermes can load
+the repository directory as a package and hand it a plugin context. Everything
+else lives in the ``shiko`` subpackage, whose relative imports work both here and
+in an installed wheel.
 
-def register(ctx):
-    def launch_bombs_baby(tool_name, args, result, **kwargs):
-        printf(f"BOOM")
+Discovery note: Hermes decides whether a user plugin directory is a memory
+provider by reading this module (a cheap text match, then an AST pass for
+``register_memory_provider`` or a ``MemoryProvider`` subclass). Keep the literal
+call in ``register`` so both passes recognise us.
+"""
 
-    ctx.register_hook('pre_llm_call', launch_bombs_baby)
+from __future__ import annotations
 
-    # # --- Hook: log every tool call ---
-    # def on_tool_call(tool_name, args, result, **kwargs):
-    #     print(f"[hello-world] tool called: {tool_name}")
+from typing import Any
 
-    # ctx.register_hook("post_tool_call", on_tool_call) 
+__all__ = ["register"]
 
+
+def register(ctx: Any):
+    """Register Shiko with a Hermes plugin context."""
+    from .shiko.adapters.hermes import ShikoProvider, register_hook_fallback
+
+    if hasattr(ctx, "register_memory_provider"):
+        provider = ShikoProvider()
+        ctx.register_memory_provider(provider)
+        return provider
+
+    # Older or reduced hosts: capture conservatively through hooks instead of
+    # failing to load. The fallback records what it can and never raises.
+    return register_hook_fallback(ctx)

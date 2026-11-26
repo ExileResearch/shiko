@@ -1,5 +1,17 @@
-# MANIFEST.in
+# Runtime files that belong in the sdist. The sdist doubles as an installable
+# copy of the Hermes plugin, so the plugin entry files ship alongside the core.
+include LICENSE
+include README.md
+include plugin.yaml
+include __init__.py
+graft shiko
+prune shiko/__pycache__
+
+# Local working notes, tests and build output never leave the maintainer's tree.
 global-exclude *.pyc
 global-exclude __pycache__
+global-exclude .DS_Store
 recursive-exclude notes *
 recursive-exclude tests *
+recursive-exclude dist *
+recursive-exclude build *

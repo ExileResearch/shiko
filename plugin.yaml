@@ -1,9 +1,24 @@
 name: shiko-memory
-version: "0.1"
-description: Adaptive Cognitive Memory Engine
+version: "0.1.0"
+description: "Adaptive cognitive memory engine — provenance-preserving recall for Hermes"
+author: "Exile Research"
+license: MIT
+homepage: "https://github.com/exileresearch/shiko"
 manifest_version: 2
 api_version: 1
-license: MIT
-tags: [gateway, demo]
+kind: backend
+tags: [memory, recall, provenance, research]
+# The provider API is the supported surface. Hermes 0.23.4 and later expose
+# PluginContext.register_memory_provider; the adapter registers hooks only when
+# that method is missing.
+requires_hermes: ">=0.23.4"
+python_dependencies: []
 config_schema:
-  api_url: { type: str, default: "", description: "Service endpoint" }
+  data_root:
+    type: str
+    default: ""
+    description: "Shiko data root. Empty means <hermes_home>/shiko (or SHIKO_HOME)."
+  owner_id:
+    type: str
+    default: ""
+    description: "Stable owner identity for this deployment. Empty derives one from the host profile."
