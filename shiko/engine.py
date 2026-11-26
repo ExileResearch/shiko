@@ -55,14 +55,21 @@ from .records import (
     artifacts_for_event,
     attach_artifact,
     create_memory,
+    derive_memory,
     effective_activation_for,
+    entities_for_memory,
+    evidence_roots,
     get_dynamics,
     get_memory,
+    link_alias,
     list_memories,
     memory_event_rollups,
     memory_events,
+    note_evidence_root,
     prune_memory_events,
     record_memory_event,
+    register_entity,
+    resolve_entity,
     revise_memory,
     set_dynamics,
 )
@@ -504,7 +511,7 @@ class Engine:
             draft = MemoryDraft(
                 kind=candidate.kind,
                 content=candidate.content,
-                evidence=(EvidenceInput(event_id, "supports", candidate.span, independence_root=event_id),),
+                evidence=(EvidenceInput(event_id, "supports", candidate.span),),
                 classifications=tuple(classifications),
                 subject_kind=candidate.subject_kind,
                 subject_id=candidate.subject_id,
@@ -602,6 +609,56 @@ class Engine:
             }
             for row in rows
         ]
+
+    # -- identity and lineage -----------------------------------------------
+
+    def register_entity(
+        self, kind: str, name: str, *, entity_id: str | None = None,
+        aliases: tuple[str, ...] = (), metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        return register_entity(
+            self._store, kind, name, entity_id=entity_id, aliases=aliases, metadata=metadata,
+        )
+
+    def resolve_entity(self, name: str) -> dict[str, Any]:
+        self._ensure_open()
+        return resolve_entity(self._store, name)
+
+    def link_alias(self, alias: str, entity_id: str, *, source_event_id: str | None = None) -> None:
+        self._ensure_open()
+        link_alias(self._store, alias, entity_id, source_event_id=source_event_id)
+
+    def entities_for_memory(self, memory_id: str) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return entities_for_memory(self._store, memory_id)
+
+    def note_evidence_root(
+        self, origin_event_id: str, *, root_id: str | None = None,
+        kind: str = "observation", parent_root_id: str | None = None,
+    ) -> str:
+        self._ensure_open()
+        return note_evidence_root(
+            self._store, origin_event_id, root_id=root_id, kind=kind, parent_root_id=parent_root_id,
+        )
+
+    def evidence_roots(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return evidence_roots(self._store, limit=limit)
+
+    def derive_memory(
+        self, parent_memory_ids: list[str], *, content: str, kind: str = "reflection",
+        method: str = "summary", policy_version: str = DEFAULT_POLICY,
+        classifications: tuple[ClassificationInput, ...] = (),
+        subject_kind: str | None = None, subject_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a derived memory that inherits its parents' evidence roots."""
+        self._ensure_open()
+        return derive_memory(
+            self._store, parent_memory_ids, content=content, kind=kind, method=method,
+            policy_version=policy_version, classifications=classifications,
+            subject_kind=subject_kind, subject_id=subject_id,
+        )
 
     def attach_artifact(
         self, event_id: str, source: str | Path | bytes, *, media_type: str, name: str = "",

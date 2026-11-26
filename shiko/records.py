@@ -12,6 +12,7 @@ a measured value and survives a round trip as one.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -137,14 +138,25 @@ def create_memory(
     now = learned_at or datetime.now(timezone.utc)
     learned = _iso(now)
     event_times: list[str] = []
+    roots: dict[str, str] = {}
     for item in draft.evidence:
-        row = store.read_one("SELECT observed_at FROM source_events WHERE event_id=?", (item.event_id,))
+        row = store.read_one(
+            "SELECT observed_at, metadata_json FROM source_events WHERE event_id=?", (item.event_id,)
+        )
         if row is None:
             raise RecordError(
                 "evidence references an event that is not in this store",
                 detail={"event_id": item.event_id, "memory_id": memory_id},
             )
         event_times.append(str(row[0]))
+        root = item.independence_root
+        if root is None:
+            try:
+                metadata = json.loads(row[1] or "{}")
+            except ValueError:
+                metadata = {}
+            root = str(metadata.get("independence_root") or item.event_id)
+        roots[item.event_id] = root
 
     event_time = _iso(draft.event_time) if draft.event_time else (event_times[0] if event_times else None)
     valid_from = _iso(draft.valid_from) if draft.valid_from else event_time
@@ -185,7 +197,19 @@ def create_memory(
                 (
                     new_id("evl"), memory_id, item.event_id, item.role,
                     item.span[0] if item.span else None, item.span[1] if item.span else None,
-                    item.independence_root or item.event_id, learned,
+                    roots[item.event_id], learned,
+                ),
+            )
+        if draft.subject_id:
+            conn.execute(
+                """
+                INSERT INTO entity_refs
+                    (entity_ref_id, entity_id, entity_kind, display_name, event_id, memory_id, created_at)
+                VALUES (?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    new_id("eref"), draft.subject_id, draft.subject_kind or "entity",
+                    draft.subject_id, memory_id, learned,
                 ),
             )
         for classification in draft.classifications:
@@ -352,6 +376,14 @@ def get_memory(store: Store, memory_id: str) -> dict[str, Any] | None:
             "event_time": temporal_row[0], "valid_from": temporal_row[1],
             "valid_to": temporal_row[2], "granularity": temporal_row[3],
         }
+    derived_from = [
+        {"parent_memory_id": row[0], "method": row[1]}
+        for row in store.read(
+            "SELECT parent_memory_id, method FROM memory_derivations "
+            "WHERE memory_id=? ORDER BY created_at, parent_memory_id",
+            (memory_id,),
+        )
+    ]
     return {
         "memory_id": row[0],
         "owner_id": row[1],
@@ -367,6 +399,7 @@ def get_memory(store: Store, memory_id: str) -> dict[str, Any] | None:
         "classifications": classifications,
         "affect": affect,
         "temporal": temporal,
+        "derived_from": derived_from,
     }
 
 
@@ -410,6 +443,205 @@ def _iso(value: datetime) -> str:
     if value.tzinfo is None:
         raise RecordError("timestamps must be timezone-aware")
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# -- entity identity, roots and derivation -----------------------------------
+
+
+def normalize_name(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).split())
+
+
+def register_entity(
+    store: Store,
+    kind: str,
+    name: str,
+    *,
+    entity_id: str | None = None,
+    aliases: tuple[str, ...] = (),
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create or update an entity and its aliases in deployment scope."""
+    if not str(name or "").strip():
+        raise RecordError("entity name is required")
+    if not str(kind or "").strip():
+        raise RecordError("entity kind is required")
+    entity = entity_id or new_id("ent")
+    now = _iso(datetime.now(timezone.utc))
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO entities (entity_id, entity_kind, canonical_name, canonical_norm, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(entity_id) DO UPDATE SET
+                entity_kind=excluded.entity_kind, canonical_name=excluded.canonical_name,
+                canonical_norm=excluded.canonical_norm, metadata_json=excluded.metadata_json
+            """,
+            (entity, kind, str(name).strip(), normalize_name(name), json.dumps(dict(metadata or {})), now),
+        )
+        for alias in (str(name), *aliases):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO entity_aliases (alias_norm, entity_id, alias, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (normalize_name(alias), entity, str(alias).strip(), now),
+            )
+    return get_entity(store, entity) or {}
+
+
+def get_entity(store: Store, entity_id: str) -> dict[str, Any] | None:
+    row = store.read_one(
+        "SELECT entity_id, entity_kind, canonical_name, metadata_json FROM entities WHERE entity_id=?",
+        (entity_id,),
+    )
+    if row is None:
+        return None
+    aliases = [
+        alias for (alias,) in store.read(
+            "SELECT alias FROM entity_aliases WHERE entity_id=? ORDER BY alias", (entity_id,)
+        )
+    ]
+    return {
+        "entity_id": row[0], "kind": row[1], "name": row[2],
+        "aliases": aliases, "metadata": json.loads(row[3] or "{}"),
+    }
+
+
+def link_alias(store: Store, alias: str, entity_id: str, *, source_event_id: str | None = None) -> None:
+    if store.read_one("SELECT 1 FROM entities WHERE entity_id=?", (entity_id,)) is None:
+        raise RecordError("alias references an unknown entity", detail={"entity_id": entity_id})
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO entity_aliases (alias_norm, entity_id, alias, source_event_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (normalize_name(alias), entity_id, str(alias).strip(), source_event_id,
+             _iso(datetime.now(timezone.utc))),
+        )
+
+
+def resolve_entity(store: Store, name: str) -> dict[str, Any]:
+    """Resolve a name or alias, preserving ambiguity instead of guessing."""
+    norm = normalize_name(name)
+    rows = store.read(
+        """
+        SELECT DISTINCT e.entity_id, e.entity_kind, e.canonical_name
+        FROM entities e LEFT JOIN entity_aliases a ON a.entity_id = e.entity_id
+        WHERE e.canonical_norm = ? OR a.alias_norm = ?
+        ORDER BY e.entity_id
+        """,
+        (norm, norm),
+    )
+    matches = [
+        {
+            "entity_id": row[0], "kind": row[1], "name": row[2],
+            "aliases": [alias for (alias,) in store.read(
+                "SELECT alias FROM entity_aliases WHERE entity_id=? ORDER BY alias", (row[0],)
+            )],
+        }
+        for row in rows
+    ]
+    return {"query": name, "normalized": norm, "matches": matches, "ambiguous": len(matches) > 1}
+
+
+def entities_for_memory(store: Store, memory_id: str) -> list[dict[str, Any]]:
+    return [
+        {"entity_id": row[0], "kind": row[1], "display_name": row[2]}
+        for row in store.read(
+            "SELECT entity_id, entity_kind, display_name FROM entity_refs "
+            "WHERE memory_id=? ORDER BY created_at, entity_id",
+            (memory_id,),
+        )
+    ]
+
+
+def note_evidence_root(
+    store: Store,
+    origin_event_id: str,
+    *,
+    root_id: str | None = None,
+    kind: str = "observation",
+    parent_root_id: str | None = None,
+) -> str:
+    """Record where an independent evidence root came from (echo, summary, import)."""
+    if store.read_one("SELECT 1 FROM source_events WHERE event_id=?", (origin_event_id,)) is None:
+        raise RecordError("evidence root references an unknown event", detail={"event_id": origin_event_id})
+    root = root_id or new_id("root")
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO evidence_roots (root_id, origin_event_id, kind, parent_root_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(root_id) DO UPDATE SET
+                origin_event_id=excluded.origin_event_id, kind=excluded.kind,
+                parent_root_id=excluded.parent_root_id
+            """,
+            (root, origin_event_id, kind, parent_root_id, _iso(datetime.now(timezone.utc))),
+        )
+    return root
+
+
+def evidence_roots(store: Store, *, limit: int = 200) -> list[dict[str, Any]]:
+    return [
+        {"root_id": row[0], "origin_event_id": row[1], "kind": row[2], "parent_root_id": row[3]}
+        for row in store.read(
+            "SELECT root_id, origin_event_id, kind, parent_root_id FROM evidence_roots "
+            "ORDER BY created_at, root_id LIMIT ?",
+            (int(limit),),
+        )
+    ]
+
+
+def derive_memory(
+    store: Store,
+    parent_memory_ids: list[str],
+    *,
+    content: str,
+    kind: str = "reflection",
+    method: str = "summary",
+    policy_version: str,
+    classifications: tuple[ClassificationInput, ...] = (),
+    subject_kind: str | None = None,
+    subject_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a derived memory from parents, inheriting their evidence roots."""
+    if not parent_memory_ids:
+        raise RecordError("derivation needs at least one parent memory")
+    evidence: list[EvidenceInput] = []
+    seen: set[tuple[str, str]] = set()
+    for parent in parent_memory_ids:
+        if get_memory(store, parent) is None:
+            raise RecordError("derivation references an unknown memory", detail={"memory_id": parent})
+        for event_id, root in store.read(
+            "SELECT event_id, independence_root FROM evidence_links WHERE memory_id=? ORDER BY created_at",
+            (parent,),
+        ):
+            key = (str(event_id), str(root))
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence.append(EvidenceInput(str(event_id), "derives", independence_root=str(root)))
+    if not evidence:
+        raise RecordError("parents have no evidence to derive from")
+    memory = create_memory(
+        store,
+        MemoryDraft(
+            kind=kind, content=content, evidence=tuple(evidence),
+            classifications=classifications, subject_kind=subject_kind, subject_id=subject_id,
+            metadata={"derived": True, "method": method},
+        ),
+        policy_version=policy_version,
+    )
+    with store.transaction() as conn:
+        for parent in parent_memory_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_derivations (memory_id, parent_memory_id, method, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (memory["memory_id"], parent, method, _iso(datetime.now(timezone.utc))),
+            )
+    return get_memory(store, memory["memory_id"]) or {}
 
 
 # -- lifecycle history -------------------------------------------------------

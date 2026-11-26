@@ -25,6 +25,7 @@ from shiko import (
     open_engine,
 )
 from shiko.backends import BackendTimeout, OpenAIBackend, RecordedBackend
+from shiko.llm_config import ConfigError, build_backend, load_settings
 from shiko.records import EvidenceInput
 
 
@@ -43,24 +44,22 @@ def _capture(engine, content: str, *, event_id: str, session="s1",
 
 
 def _live_backend() -> OpenAIBackend | None:
-    """Read the host's key for an opt-in live run; never printed or logged."""
-    env_file = Path.home() / ".hermes" / ".env"
-    key = ""
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("OPENCODE_GO_API_KEY="):
-                key = line.split("=", 1)[1].strip()
-                break
-    if not key:
+    """Resolve the live backend from config/env; the key is never printed."""
+    env = dict(os.environ)
+    env.setdefault("SHIKO_ENV_FILE", str(Path.home() / ".hermes" / ".env"))
+    env.setdefault("SHIKO_LLM_PROVIDER", "opencode")
+    env.setdefault("SHIKO_LLM_MODEL", "deepseek-v4.1-flash")
+    env.setdefault("SHIKO_LLM_TEMPERATURE", "0.3")
+    if str(env["SHIKO_LLM_MODEL"]).startswith("deepseek"):
+        env.setdefault("SHIKO_LLM_REASONING_EFFORT", "none")
+        env.setdefault("SHIKO_LLM_EXTRA_BODY", '{"thinking": {"type": "disabled"}}')
+    try:
+        settings = load_settings(env=env)
+    except ConfigError:
         return None
-    return OpenAIBackend(
-        base_url=os.environ.get("SHIKO_LLM_BASE_URL", "https://opencode.ai/zen/go/v1"),
-        api_key=key,
-        model_id=os.environ.get("SHIKO_LLM_MODEL", "qwen3.8-flash"),
-        temperature=0.6,
-        max_tokens=1600,
-        extra_headers={"x-opencode-session": "shiko-live-extraction"},
-    )
+    if not settings.api_key:
+        return None
+    return build_backend(settings)
 
 
 TEXT = (
@@ -253,3 +252,86 @@ def test_candidate_extraction(tmp_path):
         "memories": [_content(m)[:80] for m in live_engine.memories()],
     }))
     live_engine.close()
+
+
+# -- 3.2 ---------------------------------------------------------------------
+
+
+def test_identity_and_evidence_lineage(tmp_path):
+    """Phase 3.2 — roots, delegation and ambiguous entity names survive."""
+    engine = _engine(tmp_path)
+    report = engine.capture_text(
+        "measured 82 g", event_id="rep-1", session_id="parent-session",
+        source_kind="subagent.report", actor=Actor("helper-1", ActorKind.SUBAGENT),
+        delegation_parent="parent-session", metadata={"independence_root": "root-helper"},
+    )
+    echo = engine.capture_text(
+        "the helper measured 82 g", event_id="echo-1", session_id="parent-session",
+        source_kind="assistant.message", actor=Actor("jiko", ActorKind.OWNER),
+        metadata={"independence_root": "root-helper"},
+    )
+    tool = engine.capture_text(
+        "scale reading 82.1 g", event_id="tool-1", session_id="parent-session",
+        source_kind="tool.reading", actor=Actor("kitchen-scale", ActorKind.TOOL),
+    )
+    assert report.ok and echo.ok and tool.ok
+
+    def memory(content: str, event_id: str, **kwargs):
+        return engine.create_memory(MemoryDraft(
+            kind="semantic", content=content,
+            evidence=(EvidenceInput(event_id),), **kwargs,
+        ))
+
+    measured = memory("82 g measured by the helper", "rep-1")
+    paraphrase = memory("the helper measured 82 g", "echo-1")
+    independent = memory("82.1 g on the kitchen scale", "tool-1")
+    roots = {
+        item["memory_id"]: item["evidence"][0]["independence_root"]
+        for item in (measured, paraphrase, independent)
+    }
+    assert roots[measured["memory_id"]] == roots[paraphrase["memory_id"]] == "root-helper"
+    assert roots[independent["memory_id"]] == "tool-1"
+
+    stored = engine.get_event("rep-1")
+    assert stored is not None
+    assert stored["actor_id"] == "helper-1"
+    assert stored["actor_kind"] == "subagent"
+    assert stored["delegation_parent"] == "parent-session"
+
+    engine.note_evidence_root("rep-1", root_id="root-helper", kind="observation")
+    engine.note_evidence_root("echo-1", root_id="root-helper", kind="echo", parent_root_id="root-helper")
+    recorded = engine.evidence_roots()
+    assert len(recorded) == 1
+    assert recorded[0]["root_id"] == "root-helper" and recorded[0]["kind"] == "echo"
+
+    derived = engine.derive_memory(
+        [measured["memory_id"], independent["memory_id"]],
+        content="Two independent sources agree near 82 g.",
+        method="summary",
+    )
+    assert {item["parent_memory_id"] for item in derived["derived_from"]} == {
+        measured["memory_id"], independent["memory_id"],
+    }
+    assert {item["independence_root"] for item in derived["evidence"]} == {"root-helper", "tool-1"}
+    assert derived["metadata"]["derived"] is True
+    assert len(engine.get_memory(measured["memory_id"])["revisions"]) == 1
+
+    # Two devices share a nickname: the resolver returns both instead of merging.
+    first = engine.register_entity("device", "wrist camera", entity_id="cam-a", aliases=("wrist cam",))
+    second = engine.register_entity("device", "wrist camera", entity_id="cam-b")
+    assert first["entity_id"] == "cam-a" and second["entity_id"] == "cam-b"
+    resolution = engine.resolve_entity("Wrist Camera")
+    assert resolution["ambiguous"] is True
+    assert {item["entity_id"] for item in resolution["matches"]} == {"cam-a", "cam-b"}
+    alias = engine.resolve_entity("wrist cam")
+    assert alias["ambiguous"] is False
+    assert alias["matches"] and alias["matches"][0]["entity_id"] == "cam-a"
+    engine.link_alias("camera", "cam-b", source_event_id="tool-1")
+    assert {item["entity_id"] for item in engine.resolve_entity("camera")["matches"]} == {"cam-b"}
+
+    camera_a = memory("camera A has a 6 mm lens", "rep-1", subject_kind="device", subject_id="cam-a")
+    camera_b = memory("camera B has an 8 mm lens", "echo-1", subject_kind="device", subject_id="cam-b")
+    assert engine.entities_for_memory(camera_a["memory_id"])[0]["entity_id"] == "cam-a"
+    assert engine.entities_for_memory(camera_b["memory_id"])[0]["entity_id"] == "cam-b"
+    assert camera_a["memory_id"] != camera_b["memory_id"]
+    engine.close()

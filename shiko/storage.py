@@ -31,7 +31,7 @@ from .envelope import SourceEnvelope
 from .errors import StorageError
 from .results import CaptureResult, Diagnostic, Severity
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DB_NAME = "shiko.db"
 
 # Columns every event read shares, so get_event() and list_events() cannot drift.
@@ -355,8 +355,55 @@ def _migration_4(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migration_5(conn: sqlite3.Connection) -> None:
+    """Entity identity, evidence roots and derivation links."""
+    for statement in (
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            entity_id      TEXT PRIMARY KEY,
+            entity_kind    TEXT NOT NULL,
+            canonical_name TEXT NOT NULL,
+            canonical_norm TEXT NOT NULL,
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS entities_norm ON entities (canonical_norm)",
+        """
+        CREATE TABLE IF NOT EXISTS entity_aliases (
+            alias_norm   TEXT NOT NULL,
+            entity_id    TEXT NOT NULL REFERENCES entities(entity_id) ON DELETE CASCADE,
+            alias        TEXT NOT NULL,
+            source_event_id TEXT,
+            created_at   TEXT NOT NULL,
+            PRIMARY KEY (alias_norm, entity_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS entity_aliases_norm ON entity_aliases (alias_norm)",
+        """
+        CREATE TABLE IF NOT EXISTS evidence_roots (
+            root_id         TEXT PRIMARY KEY,
+            origin_event_id TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            parent_root_id  TEXT,
+            created_at      TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memory_derivations (
+            memory_id        TEXT NOT NULL REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            parent_memory_id TEXT NOT NULL,
+            method           TEXT NOT NULL,
+            created_at       TEXT NOT NULL,
+            PRIMARY KEY (memory_id, parent_memory_id, method)
+        )
+        """,
+    ):
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
-    _migration_1, _migration_2, _migration_3, _migration_4,
+    _migration_1, _migration_2, _migration_3, _migration_4, _migration_5,
 )
 
 
