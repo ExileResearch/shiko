@@ -34,6 +34,17 @@ from .envelope import (
     build_envelope,
 )
 from .errors import EngineClosedError, ShikoError, StorageError
+from .episodes import (
+    EpisodeError,
+    add_step as add_episode_step_record,
+    close_episode as close_episode_record,
+    episode_for_session as episode_for_session_record,
+    get_episode as get_episode_record,
+    link_memory as link_episode_memory_record,
+    list_episodes,
+    record_outcome as record_episode_outcome_record,
+    start_episode as start_episode_record,
+)
 from .extraction import (
     Candidate,
     ExtractionError,
@@ -713,6 +724,55 @@ class Engine:
             policy_version=policy_version, classifications=classifications,
             subject_kind=subject_kind, subject_id=subject_id,
         )
+
+    # -- episodes -----------------------------------------------------------
+
+    def start_episode(
+        self, title: str, *, goal: str | None = None, participants: tuple[str, ...] = (),
+        tags: tuple[str, ...] = (), session_id: str | None = None,
+        at: datetime | None = None, metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        return start_episode_record(
+            self._store, title, goal=goal, participants=participants, tags=tags,
+            session_id=session_id, at=at, metadata=metadata,
+        )
+
+    def add_episode_step(self, episode_id: str, role: str, content: str, **kwargs: Any) -> dict[str, Any]:
+        self._ensure_open()
+        return add_episode_step_record(self._store, episode_id, role, content, **kwargs)
+
+    def record_episode_outcome(
+        self, episode_id: str, correlation_id: str, content: str, **kwargs: Any,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        return record_episode_outcome_record(
+            self._store, episode_id, correlation_id, content, **kwargs,
+        )
+
+    def link_episode_memory(
+        self, episode_id: str, memory_id: str, *, role: str = "supports",
+    ) -> None:
+        self._ensure_open()
+        link_episode_memory_record(self._store, episode_id, memory_id, role=role)
+
+    def close_episode(
+        self, episode_id: str, *, status: str = "completed", at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+        return close_episode_record(self._store, episode_id, status=status, at=at)
+
+    def get_episode(self, episode_id: str) -> dict[str, Any] | None:
+        self._ensure_open()
+        return get_episode_record(self._store, episode_id)
+
+    def episodes(self, *, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return list_episodes(self._store, status=status, limit=limit)
+
+    def episode_for_session(self, session_id: str) -> dict[str, Any] | None:
+        self._ensure_open()
+        return episode_for_session_record(self._store, session_id)
 
     def attach_artifact(
         self, event_id: str, source: str | Path | bytes, *, media_type: str, name: str = "",

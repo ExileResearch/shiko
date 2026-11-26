@@ -414,3 +414,145 @@ def test_identity_and_evidence_lineage(tmp_path):
     assert engine.entities_for_memory(camera_b["memory_id"])[0]["entity_id"] == "cam-b"
     assert camera_a["memory_id"] != camera_b["memory_id"]
     engine.close()
+
+
+# -- 3.3 ---------------------------------------------------------------------
+
+
+def test_episodes_across_turns_and_sessions(tmp_path):
+    """Phase 3.3 — ordered episodes, two experiments, delayed outcomes."""
+    from datetime import datetime, timezone
+
+    engine = _engine(tmp_path)
+    started = datetime(2026, 11, 18, 10, 0, tzinfo=timezone.utc)
+    gear = _capture(engine, "changed the gearing to 3:1", event_id="gear-1", session="s1")
+    action_a = _capture(engine, "run the load test", event_id="act-a", session="s1",
+                        source_kind="tool.call", actor=Actor("jiko", ActorKind.OWNER))
+    action_b = _capture(engine, "run the pulley comparison", event_id="act-b", session="s1",
+                        source_kind="tool.call", actor=Actor("jiko", ActorKind.OWNER))
+    outcome_b = _capture(engine, "pulley comparison passed", event_id="out-b", session="s1",
+                         source_kind="tool.result", actor=Actor("jiko", ActorKind.OWNER))
+
+    first = engine.start_episode(
+        "Gearing change and load test", goal="verify the wrist camera mount",
+        participants=("robin", "jiko"), tags=("arm", "hardware"),
+        session_id="s1", at=started,
+    )
+    second = engine.start_episode("Pulley comparison", goal="compare pulleys", session_id="s1", at=started)
+    first_id, second_id = first["episode_id"], second["episode_id"]
+
+    observation = engine.add_episode_step(
+        first_id, "observation", "gearing changed to 3:1",
+        event_id=gear.event_id, session_id="s1", scope="user", actor_id="robin",
+    )
+    step_a1 = engine.add_episode_step(
+        first_id, "action", "run the load test", event_id=action_a.event_id,
+        session_id="s1", actor_id="jiko", scope="shared",
+    )
+    step_a2 = engine.add_episode_step(
+        second_id, "action", "run the pulley comparison", event_id=action_b.event_id,
+        session_id="s1", actor_id="jiko",
+    )
+    reflection = engine.add_episode_step(
+        first_id, "reflection", "the mount may flex under load", actor_id="jiko",
+    )
+
+    correlation_a = step_a1["actions"][0]["correlation_id"]
+    correlation_b = step_a2["actions"][0]["correlation_id"]
+    assert correlation_a != correlation_b
+    assert step_a1["steps"][0]["scope"] == "user"
+    assert step_a1["steps"][0]["actor_id"] == "robin"
+    assert reflection["steps"][-1]["role"] == "reflection"
+    assert reflection["steps"][-1]["event_id"] is None
+
+    # The pulley comparison finishes immediately; the load test stays pending.
+    second_after = engine.record_episode_outcome(
+        second_id, correlation_b, "pulley comparison passed",
+        outcome="success", event_id=outcome_b.event_id, session_id="s1",
+    )
+    assert second_after["status"] == "completed"
+    assert second_after["actions"][0]["status"] == "completed"
+
+    pending = engine.get_episode(first_id)
+    assert pending is not None
+    assert pending["status"] == "open"
+    assert pending["actions"][0]["status"] == "pending"
+    assert [item["role"] for item in pending["steps"]] == ["observation", "action", "reflection"]
+    assert pending["actions"][0]["outcome_step_id"] is None
+    assert pending["ended_at"] is None
+
+    # Session ends, the engine reopens, and the result arrives in a new session.
+    engine.close()
+    engine = _engine(tmp_path)
+    outcome_a = _capture(engine, "load test completed", event_id="out-a", session="s2",
+                         source_kind="tool.result", actor=Actor("jiko", ActorKind.OWNER))
+    completed = engine.record_episode_outcome(
+        first_id, correlation_a, "load test completed at 82 g",
+        outcome="success", event_id=outcome_a.event_id, session_id="s2",
+    )
+    assert completed["status"] == "completed"
+    assert completed["actions"][0]["status"] == "completed"
+    assert completed["steps"][-1]["session_id"] == "s2"
+    assert completed["duration_seconds"] is not None and completed["duration_seconds"] > 0
+    assert [item["sequence"] for item in completed["steps"]] == [1, 2, 3, 4]
+    assert [item["role"] for item in completed["steps"]] == [
+        "observation", "action", "reflection", "outcome",
+    ]
+    assert completed["participants"] == ["robin", "jiko"]
+    assert completed["tags"] == ["arm", "hardware"]
+
+    # One source event informed two memory types without cloning the event.
+    gear_memory = engine.create_memory(MemoryDraft(
+        kind="episodic", content="We changed the arm gearing to 3:1.",
+        evidence=(EvidenceInput(gear.event_id),),
+    ))
+    semantic = engine.create_memory(MemoryDraft(
+        kind="semantic", content="The arm uses a 3:1 gearing.",
+        evidence=(EvidenceInput(gear.event_id),),
+    ))
+    assert gear_memory["memory_id"] != semantic["memory_id"]
+    assert gear_memory["evidence"][0]["event_id"] == semantic["evidence"][0]["event_id"] == gear.event_id
+    engine.link_episode_memory(first_id, gear_memory["memory_id"], role="describes")
+    engine.link_episode_memory(first_id, semantic["memory_id"], role="derives")
+    linked = engine.get_episode(first_id)
+    assert linked is not None
+    assert {item["memory_id"] for item in linked["memories"]} == {
+        gear_memory["memory_id"], semantic["memory_id"],
+    }
+
+    # A missing result stays explicitly pending.
+    open_episode = engine.start_episode("Unfinished test", goal="measure flex", session_id="s3")
+    open_step = engine.add_episode_step(
+        open_episode["episode_id"], "action", "apply 2 kg and measure",
+        event_id=None, session_id="s3",
+    )
+    assert open_step["status"] == "open"
+    assert open_step["actions"][0]["status"] == "pending"
+    assert open_step["actions"][0]["outcome_step_id"] is None
+    assert open_step["steps"][0]["status"] == "pending"
+    open_view = engine.get_episode(open_episode["episode_id"])
+    assert open_view is not None and open_view["steps"][0]["outcome"] is None
+
+    # A failed attempt is distinct from a missing one.
+    failed_episode = engine.start_episode("Failed attempt", session_id="s3")
+    failed_step = engine.add_episode_step(
+        failed_episode["episode_id"], "action", "tighten the set screw",
+    )
+    failed = engine.record_episode_outcome(
+        failed_episode["episode_id"], failed_step["actions"][0]["correlation_id"],
+        "the screw stripped", outcome="failure",
+    )
+    assert failed["status"] == "failed"
+    assert failed["actions"][0]["status"] == "failed"
+
+    engine.close()
+    reopened = _engine(tmp_path)
+    replay = reopened.get_episode(first_id)
+    assert replay is not None
+    assert replay["status"] == "completed"
+    assert [item["step_id"] for item in replay["steps"]] == [
+        item["step_id"] for item in completed["steps"]
+    ]
+    assert len(reopened.episodes()) == 4
+    assert [item["episode_id"] for item in reopened.episodes(status="open")] == [open_episode["episode_id"]]
+    reopened.close()

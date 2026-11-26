@@ -43,6 +43,7 @@ from .extraction import (
     Rejection,
     StructuredExtractor,
 )
+from .episodes import EpisodeError
 from .backends import OpenAIBackend, RecordedBackend, backend_from_env
 from .llm_config import (
     ConfigError,
@@ -97,6 +98,7 @@ __all__ = [
     "GenerativeExtractor",
     "Rejection",
     "StructuredExtractor",
+    "EpisodeError",
     "OpenAIBackend",
     "RecordedBackend",
     "backend_from_env",

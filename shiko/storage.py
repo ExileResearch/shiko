@@ -31,7 +31,7 @@ from .envelope import SourceEnvelope
 from .errors import StorageError
 from .results import CaptureResult, Diagnostic, Severity
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DB_NAME = "shiko.db"
 
 # Columns every event read shares, so get_event() and list_events() cannot drift.
@@ -402,8 +402,71 @@ def _migration_5(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migration_6(conn: sqlite3.Connection) -> None:
+    """Episodes, ordered steps, action/outcome correlations and links."""
+    for statement in (
+        """
+        CREATE TABLE IF NOT EXISTS episodes (
+            episode_id       TEXT PRIMARY KEY,
+            owner_id         TEXT NOT NULL,
+            title            TEXT NOT NULL,
+            goal             TEXT,
+            status           TEXT NOT NULL,
+            session_id       TEXT,
+            started_at       TEXT NOT NULL,
+            ended_at         TEXT,
+            duration_seconds REAL,
+            tags_json        TEXT NOT NULL DEFAULT '[]',
+            participants_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json    TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS episodes_status ON episodes (status, started_at)",
+        """
+        CREATE TABLE IF NOT EXISTS episode_steps (
+            step_id        TEXT PRIMARY KEY,
+            episode_id     TEXT NOT NULL REFERENCES episodes(episode_id) ON DELETE CASCADE,
+            sequence       INTEGER NOT NULL,
+            role           TEXT NOT NULL,
+            content        TEXT NOT NULL DEFAULT '',
+            event_id       TEXT,
+            memory_id      TEXT,
+            correlation_id TEXT,
+            outcome        TEXT,
+            status         TEXT NOT NULL DEFAULT 'recorded',
+            occurred_at    TEXT NOT NULL,
+            session_id     TEXT,
+            scope          TEXT NOT NULL DEFAULT 'internal',
+            actor_id       TEXT,
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
+            UNIQUE (episode_id, sequence)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS episode_actions (
+            correlation_id  TEXT PRIMARY KEY,
+            episode_id      TEXT NOT NULL REFERENCES episodes(episode_id) ON DELETE CASCADE,
+            action_step_id  TEXT NOT NULL,
+            outcome_step_id TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS episode_memories (
+            episode_id TEXT NOT NULL REFERENCES episodes(episode_id) ON DELETE CASCADE,
+            memory_id  TEXT NOT NULL,
+            role       TEXT NOT NULL DEFAULT 'supports',
+            PRIMARY KEY (episode_id, memory_id, role)
+        )
+        """,
+    ):
+        conn.execute(statement)
+
+
 MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
-    _migration_1, _migration_2, _migration_3, _migration_4, _migration_5,
+    _migration_1, _migration_2, _migration_3, _migration_4, _migration_5, _migration_6,
 )
 
 
