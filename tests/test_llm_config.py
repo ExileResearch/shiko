@@ -37,6 +37,16 @@ def test_provider_switch_uses_openrouter_preset(tmp_path) -> None:
     assert "test-key" not in json.dumps(settings.to_public_dict())
 
 
+def test_opencode_defaults_to_deepseek_with_thinking_disabled(tmp_path) -> None:
+    settings = load_settings(config_path=tmp_path / "missing.toml", env={
+        "OPENCODE_GO_API_KEY": "test-key",
+    })
+    assert settings.model == "deepseek-v4.1-flash"
+    assert settings.reasoning_effort == "none"
+    assert settings.extra_body == {"thinking": {"type": "disabled"}}
+    assert settings.headers["x-opencode-session"].startswith("shiko-")
+
+
 def test_toml_table_and_env_precedence(tmp_path) -> None:
     config = tmp_path / "config.toml"
     config.write_text(

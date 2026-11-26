@@ -38,7 +38,7 @@ PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     "opencode": {
         "base_url": "https://opencode.ai/zen/go/v1",
         "api_key_env": "OPENCODE_GO_API_KEY",
-        "model": "qwen3.8-flash",
+        "model": "deepseek-v4.1-flash",
         "session_header": "x-opencode-session",
     },
     "openrouter": {
@@ -193,6 +193,12 @@ def load_settings(
         or table.get("reasoning_effort")
         or None
     )
+    if reasoning is None and chosen_model.lower().startswith("deepseek"):
+        # DeepSeek's reasoning can consume the whole completion budget before
+        # the JSON answer starts; extraction needs the answer, not the thoughts.
+        reasoning = "none"
+        if "thinking" not in extra_body:
+            extra_body["thinking"] = {"type": "disabled"}
 
     return LLMSettings(
         provider=chosen_provider,

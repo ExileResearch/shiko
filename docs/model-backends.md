@@ -35,7 +35,7 @@ prompt to a reasoning model that returns empty content.
 ```toml
 [llm]
 provider = "opencode"
-model = "qwen3.8-flash"
+model = "deepseek-v4.1-flash"
 temperature = 0.3
 max_tokens = 1600
 # env_file = "~/.hermes/.env"
