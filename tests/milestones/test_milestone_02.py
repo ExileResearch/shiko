@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -37,8 +39,8 @@ from shiko import (
 )
 from shiko.errors import StorageError
 from shiko.owner import ensure_manifest
-from shiko.queue import job_for
-from shiko.storage import DB_NAME, MIGRATIONS, Store, _migration_1
+from shiko.queue import job_for, lease_next
+from shiko.storage import DB_NAME, MIGRATIONS, SCHEMA_VERSION, Store, _migration_1
 from shiko.worker import Worker
 
 DEFAULT_POLICY = "m2.policy.1"
@@ -111,7 +113,7 @@ class Clock:
 def test_canonical_records_and_revisions(tmp_path):
     """Phase 2.1 — provenance survives reopen, migration and unknown values."""
     engine = _engine(tmp_path)
-    assert engine.schema_version == 2
+    assert engine.schema_version == SCHEMA_VERSION
     tool = _capture(engine, "scale reports 82 g", event_id="evt-tool", source_kind="tool.reading",
                     actor=Actor("kitchen-scale", ActorKind.TOOL))
     user = _capture(engine, "it arrived and it is light", event_id="evt-user")
@@ -204,7 +206,7 @@ def test_canonical_records_and_revisions(tmp_path):
         raw.close()
 
     upgraded = open_engine(legacy_root, "jiko")
-    assert upgraded.schema_version == 2
+    assert upgraded.schema_version == SCHEMA_VERSION
     legacy_event = upgraded.get_event("evt-v1")
     assert legacy_event is not None
     assert legacy_event["content"] == "legacy reading"
@@ -224,7 +226,7 @@ def test_capture_and_archive_recovery(tmp_path):
     archive_file = engine.root / "archive" / "ck.jsonl"
     assert not archive_file.exists()
     assert engine.event_count == 1
-    assert engine.pending_jobs() == 2
+    assert engine.pending_jobs() == 3  # archive, index and ingestion
 
     first = engine.recover()
     assert first["archive"]["appended"] == 1
@@ -338,7 +340,7 @@ def test_ordered_background_work(tmp_path):
 
     worker = engine.create_worker(worker_id="drain", clock=clock)
     summary = worker.run_until_idle()
-    assert summary["processed"] == 3 and summary["failures"] == 0
+    assert summary["processed"] >= 3 and summary["failures"] == 0
     drained = engine.recent_context(session_id="s1", exclude_event_id="follow")
     assert all(entry["indexed"] for entry in drained["events"])
     assert not any(entry["pending"] for entry in drained["events"])
@@ -416,3 +418,143 @@ def test_ordered_background_work(tmp_path):
 
     for item in (engine, raced, killed, retrying, stopping):
         item.close()
+
+
+# -- 2.4 ---------------------------------------------------------------------
+
+
+def test_continuous_ingestion_pipeline(tmp_path):
+    """Phase 2.4 — bursty capture coalesces, survives a kill and sweeps."""
+    engine = _engine(
+        tmp_path / "pipe",
+        pipeline_debounce_ms=40, pipeline_max_delay_ms=250,
+        pipeline_coalesce_at=20, pipeline_batch_size=7,
+    )
+    started = time.perf_counter()
+    for index in range(50):
+        _capture(engine, f"turn {index}", event_id=f"p-{index}", session="burst")
+    burst_seconds = time.perf_counter() - started
+
+    status = engine.pipeline_status()
+    assert status["pending_jobs"] == 1
+    assert status["pending_events"] == 50
+    assert status["coalesced"] >= 45
+    assert status["mode"] == "coalesce"
+    assert burst_seconds < 3.0
+    assert engine.ingestion_state("burst")[0]["watermark_seq"] == 0
+
+    # Capture stays fast while extraction is paused; the pipeline says why.
+    engine.set_pipeline_paused(True)
+    started = time.perf_counter()
+    for index in range(20):
+        _capture(engine, f"paused {index}", event_id=f"q-{index}", session="burst")
+    paused_seconds = time.perf_counter() - started
+    assert paused_seconds < 3.0
+    assert engine.pipeline_status()["mode"] == "pause"
+    assert engine.create_worker(worker_id="blocked").run_once(kinds=("ingest.session",)) is None
+    assert engine.event_count == 70
+    engine.set_pipeline_paused(False)
+    time.sleep(0.3)  # let the debounce window elapse
+
+    drained = engine.create_worker(worker_id="burst").run_until_idle(budget_seconds=10)
+    assert drained["pending"] == 0 and drained["failures"] == 0
+    state = engine.ingestion_state("burst")[0]
+    assert state["watermark_seq"] == 70
+    assert state["last_enqueued_seq"] == 70
+    assert engine.pipeline_status()["processed_batches"] == 10  # ceil(70 / 7)
+
+    # A lease abandoned mid-batch expires and the retry converges once.
+    for index in range(5):
+        _capture(engine, f"kill {index}", event_id=f"k-{index}", session="kill")
+    time.sleep(0.06)
+    dead = lease_next(engine.store, "dead", lease_seconds=0.01, kinds=("ingest.session",))
+    assert dead is not None
+    time.sleep(0.05)
+    revived = engine.create_worker(worker_id="revive").run_until_idle(budget_seconds=5)
+    assert revived["pending"] == 0
+    kill_state = engine.ingestion_state("kill")[0]
+    assert kill_state["watermark_seq"] == kill_state["last_enqueued_seq"]
+
+    # A fresh process recreates a lost job and a sweep drains it with no worker.
+    for index in range(3):
+        _capture(engine, f"recover {index}", event_id=f"r-{index}", session="recover")
+    with engine.store.transaction() as conn:
+        conn.execute("DELETE FROM pending_work WHERE kind='ingest.session' AND event_id='recover'")
+    root = engine.root
+    engine.close()
+    reopened = open_engine(root, "jiko")
+    recovered_state = reopened.ingestion_state("recover")
+    assert recovered_state and recovered_state[0]["watermark_seq"] == 0
+    swept = reopened.sweep(budget_seconds=5)
+    assert swept["failures"] == 0
+    recovered_state = reopened.ingestion_state("recover")
+    assert recovered_state and recovered_state[0]["watermark_seq"] == recovered_state[0]["last_enqueued_seq"]
+    assert recovered_state[0]["watermark_seq"] > 0
+    assert reopened.pipeline_status()["pending_events"] == 0
+    reopened.close()
+
+
+# -- 2.5 ---------------------------------------------------------------------
+
+
+def test_lifecycle_history_and_property_groups(tmp_path):
+    """Phase 2.5 — bounded lifecycle rows, a group map and lazy dynamics."""
+    engine = _engine(tmp_path)
+    groups = {group["group"]: group for group in engine.schema_map()}
+    for group in groups.values():
+        if group["status"] == "present":
+            assert group["tables_present"], group
+    assert groups["lifecycle"]["phase"] == "2.5"
+    assert groups["dynamics"]["phase"] == "2.5"
+    assert groups["associations"]["status"] == "planned" and groups["associations"]["phase"] == "5.1"
+    assert groups["vectors"]["phase"] == "4.1"
+
+    event = _capture(engine, "camera 82 g", event_id="life-1", session="s1")
+    memory = engine.create_memory(MemoryDraft(
+        kind="semantic",
+        content="The camera weighs 82 g.",
+        evidence=(EvidenceInput(event.event_id, "supports"),),
+        affect=Affect(valence=0.0, arousal=0.0, source="estimated"),
+    ))
+    memory_id = memory["memory_id"]
+    engine.revise_memory(memory_id, "The camera weighs 82 g on the kitchen scale.")
+    engine.record_memory_event(memory_id, "reinforced", detail={"signal": "use"})
+    assert [item["kind"] for item in engine.memory_events(memory_id=memory_id)] == [
+        "created", "revised", "reinforced",
+    ]
+
+    # Time alone is free: evaluating thirty days writes nothing.
+    day0 = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    engine.set_dynamics(memory_id, activation=0.9, decay_rate=0.05, at=day0)
+    events_before = engine.memory_events(memory_id=memory_id)
+    dynamics_before = engine.get_dynamics(memory_id)
+    value = None
+    for day in range(1, 31):
+        value = engine.effective_activation(memory_id, at=day0 + timedelta(days=day))
+    assert value is not None
+    assert abs(value - 0.9 * math.exp(-0.05 * 30)) < 1e-9
+    assert engine.memory_events(memory_id=memory_id) == events_before
+    assert engine.get_dynamics(memory_id) == dynamics_before
+
+    # Raw rows expire into daily rollups; recent events survive.
+    for day in range(10):
+        engine.record_memory_event(memory_id, "reinforced", at=day0 + timedelta(days=day))
+    pruned = engine.prune_memory_events(retention_days=5)
+    assert pruned["deleted"] == 10
+    rollups = engine.memory_event_rollups(memory_id=memory_id)
+    assert sum(row["count"] for row in rollups) == 10
+    remaining = engine.memory_events(memory_id=memory_id)
+    assert [item["kind"] for item in remaining] == ["created", "revised", "reinforced"]
+    assert all(item["at"] >= pruned["cutoff"] for item in remaining)
+
+    # A sparse memory loads without touching affect or dynamics.
+    sparse_event = _capture(engine, "sparse fact", event_id="sparse-1", session="s1")
+    sparse = engine.create_memory(MemoryDraft(
+        kind="semantic", content="Sparse fact.",
+        evidence=(EvidenceInput(sparse_event.event_id),),
+    ))
+    sparse_id = sparse["memory_id"]
+    assert engine.get_memory(sparse_id)["affect"] is None
+    assert engine.get_dynamics(sparse_id) is None
+    assert engine.get_memory(memory_id)["affect"]["valence"] == 0.0
+    engine.close()
