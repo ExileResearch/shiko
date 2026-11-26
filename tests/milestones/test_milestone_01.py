@@ -82,6 +82,7 @@ SMOKE_SCRIPT = """
         "root": root,
         "owner": engine.owner_id,
         "schema": engine.schema_version,
+        "supported_schema": shiko.storage.SCHEMA_VERSION,
         "capture_status": capture.status.value,
         "capture_stored": capture.stored,
         "recall_status": recall.status.value,
@@ -193,6 +194,7 @@ def test_installable_package(built_distributions, tmp_path, monkeypatch):
     assert project["project"]["name"] == "shiko-memory"
 
     import shiko as repo_shiko
+    from shiko.storage import SCHEMA_VERSION as SUPPORTED_SCHEMA
 
     metadata = _wheel_metadata(wheel)
     assert "Requires-Python: >=3.11" in metadata
@@ -225,7 +227,7 @@ def test_installable_package(built_distributions, tmp_path, monkeypatch):
     for label, result in (("wheel", wheel_result), ("sdist", sdist_result)):
         assert result["version"] == expected_version, label
         assert result["owner"] == "smoke", label
-        assert result["schema"] == 1, label
+        assert result["schema"] == result["supported_schema"] == SUPPORTED_SCHEMA, label
         assert result["manifest"] is True, label
         assert result["capture_status"] == "ok" and result["capture_stored"] is True, label
         # An unavailable path is not an empty answer.
