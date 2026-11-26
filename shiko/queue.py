@@ -15,7 +15,7 @@ from typing import Any, Iterable
 
 from .storage import Store, new_id
 
-JOB_KINDS = frozenset({"archive.event", "index.event"})
+JOB_KINDS = frozenset({"archive.event", "index.event", "ingest.session"})
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,29 @@ def fail(
             (str(error)[:2000], _iso(retry_at), _iso(moment), job_id, worker_id, worker_id),
         )
         return "pending"
+
+
+def defer(
+    store: Store, job_id: str, *, seconds: float = 0.0, now: datetime | None = None,
+) -> bool:
+    """Return a job to the queue without consuming an attempt.
+
+    Used when a worker declines to run it (pipeline paused) or when a handler
+    finished one bounded batch and more work is already waiting.
+    """
+    moment = now or datetime.now(timezone.utc)
+    retry_at = moment + timedelta(seconds=max(0.0, seconds))
+    with store.transaction() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE pending_work
+            SET state='pending', lease_owner=NULL, lease_expires=NULL,
+                attempts=0, not_before=?, updated_at=?
+            WHERE job_id=?
+            """,
+            (_iso(retry_at), _iso(moment), job_id),
+        )
+        return cursor.rowcount > 0
 
 
 def complete_by_kind(store: Store, kind: str, event_id: str) -> bool:

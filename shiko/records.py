@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
+from .dynamics import effective_activation as _effective_activation
 from .errors import ShikoError
 from .storage import Store, new_id
 
@@ -219,6 +220,10 @@ def create_memory(
             """,
             (memory_id, event_time, valid_from, valid_to, draft.time_granularity, learned),
         )
+        _insert_event(
+            conn, memory_id, "created", at=learned, policy_version=policy_version,
+            detail={"kind": draft.kind, "revision": 1},
+        )
     return get_memory(store, memory_id) or {}
 
 
@@ -269,6 +274,10 @@ def revise_memory(
         conn.execute(
             "UPDATE memory_temporal SET event_time=?, updated_at=? WHERE memory_id=?",
             (event_time_s, now, memory_id),
+        )
+        _insert_event(
+            conn, memory_id, "revised", at=now, policy_version=policy_version,
+            detail={"revision": revision, "source_event_id": source_event_id},
         )
     return revision
 
@@ -401,3 +410,182 @@ def _iso(value: datetime) -> str:
     if value.tzinfo is None:
         raise RecordError("timestamps must be timezone-aware")
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# -- lifecycle history -------------------------------------------------------
+
+
+def _insert_event(
+    conn,
+    memory_id: str,
+    kind: str,
+    *,
+    at: str,
+    policy_version: str | None = None,
+    model_id: str | None = None,
+    detail: Mapping[str, Any] | None = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO memory_events (memory_id, kind, at, policy_version, model_id, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (memory_id, kind, at, policy_version, model_id, json.dumps(dict(detail or {}), sort_keys=True)),
+    )
+
+
+def record_memory_event(
+    store: Store,
+    memory_id: str,
+    kind: str,
+    *,
+    at: datetime | None = None,
+    policy_version: str | None = None,
+    model_id: str | None = None,
+    detail: Mapping[str, Any] | None = None,
+) -> None:
+    """Append one lifecycle event. Only real state changes should call this."""
+    if store.read_one("SELECT 1 FROM canonical_memories WHERE memory_id=?", (memory_id,)) is None:
+        raise RecordError("event references an unknown memory", detail={"memory_id": memory_id})
+    moment = at or datetime.now(timezone.utc)
+    with store.transaction() as conn:
+        _insert_event(
+            conn, memory_id, kind, at=_iso(moment),
+            policy_version=policy_version, model_id=model_id, detail=detail,
+        )
+
+
+def memory_events(
+    store: Store, *, memory_id: str | None = None, kind: str | None = None, limit: int = 200,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if memory_id is not None:
+        clauses.append("memory_id=?")
+        params.append(memory_id)
+    if kind is not None:
+        clauses.append("kind=?")
+        params.append(kind)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(int(limit))
+    rows = store.read(
+        f"SELECT seq, memory_id, kind, at, policy_version, model_id, detail_json "
+        f"FROM memory_events {where} ORDER BY seq DESC LIMIT ?",
+        tuple(params),
+    )
+    return [
+        {
+            "seq": row[0], "memory_id": row[1], "kind": row[2], "at": row[3],
+            "policy_version": row[4], "model_id": row[5], "detail": json.loads(row[6] or "{}"),
+        }
+        for row in reversed(rows)
+    ]
+
+
+def prune_memory_events(
+    store: Store, *, retention_days: int = 30, now: datetime | None = None,
+) -> dict[str, Any]:
+    """Move old raw events into daily rollups, then delete them."""
+    if retention_days < 0:
+        raise RecordError("retention_days must be non-negative")
+    moment = now or datetime.now(timezone.utc)
+    cutoff = _iso(moment - timedelta(days=int(retention_days)))
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_event_rollups (day, memory_id, kind, count)
+            SELECT substr(at, 1, 10), memory_id, kind, COUNT(*)
+            FROM memory_events WHERE at < ?
+            GROUP BY 1, 2, 3
+            ON CONFLICT(day, memory_id, kind) DO UPDATE SET count = count + excluded.count
+            """,
+            (cutoff,),
+        )
+        deleted = conn.execute("DELETE FROM memory_events WHERE at < ?", (cutoff,)).rowcount
+    return {"cutoff": cutoff, "deleted": int(deleted or 0)}
+
+
+def memory_event_rollups(
+    store: Store, *, memory_id: str | None = None, limit: int = 200,
+) -> list[dict[str, Any]]:
+    if memory_id is None:
+        rows = store.read(
+            "SELECT day, memory_id, kind, count FROM memory_event_rollups "
+            "ORDER BY day DESC, memory_id LIMIT ?",
+            (int(limit),),
+        )
+    else:
+        rows = store.read(
+            "SELECT day, memory_id, kind, count FROM memory_event_rollups "
+            "WHERE memory_id=? ORDER BY day DESC LIMIT ?",
+            (memory_id, int(limit)),
+        )
+    return [{"day": r[0], "memory_id": r[1], "kind": r[2], "count": int(r[3])} for r in rows]
+
+
+# -- dynamics ----------------------------------------------------------------
+
+
+def set_dynamics(
+    store: Store,
+    memory_id: str,
+    *,
+    activation: float | None = None,
+    baseline_activation: float | None = None,
+    storage_strength: float | None = None,
+    retrieval_strength: float | None = None,
+    reinforcement: float | None = None,
+    decay_rate: float | None = None,
+    at: datetime | None = None,
+) -> None:
+    if store.read_one("SELECT 1 FROM canonical_memories WHERE memory_id=?", (memory_id,)) is None:
+        raise RecordError("dynamics reference an unknown memory", detail={"memory_id": memory_id})
+    moment = _iso(at or datetime.now(timezone.utc))
+    with store.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_dynamics
+                (memory_id, activation, baseline_activation, storage_strength, retrieval_strength,
+                 reinforcement, decay_rate, last_updated, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                activation=COALESCE(excluded.activation, memory_dynamics.activation),
+                baseline_activation=COALESCE(excluded.baseline_activation, memory_dynamics.baseline_activation),
+                storage_strength=COALESCE(excluded.storage_strength, memory_dynamics.storage_strength),
+                retrieval_strength=COALESCE(excluded.retrieval_strength, memory_dynamics.retrieval_strength),
+                reinforcement=COALESCE(excluded.reinforcement, memory_dynamics.reinforcement),
+                decay_rate=COALESCE(excluded.decay_rate, memory_dynamics.decay_rate),
+                last_updated=excluded.last_updated,
+                updated_at=excluded.updated_at
+            """,
+            (
+                memory_id, activation, baseline_activation, storage_strength, retrieval_strength,
+                reinforcement, decay_rate, moment, moment,
+            ),
+        )
+
+
+def get_dynamics(store: Store, memory_id: str) -> dict[str, Any] | None:
+    row = store.read_one(
+        "SELECT activation, baseline_activation, storage_strength, retrieval_strength, "
+        "reinforcement, decay_rate, last_updated FROM memory_dynamics WHERE memory_id=?",
+        (memory_id,),
+    )
+    if row is None:
+        return None
+    return {
+        "activation": row[0], "baseline_activation": row[1], "storage_strength": row[2],
+        "retrieval_strength": row[3], "reinforcement": row[4], "decay_rate": row[5],
+        "last_updated": row[6],
+    }
+
+
+def effective_activation_for(store: Store, memory_id: str, *, at: datetime | None = None) -> float | None:
+    """Current activation from stored state, without writing anything."""
+    record = get_dynamics(store, memory_id)
+    if record is None:
+        return None
+    moment = at or datetime.now(timezone.utc)
+    last = datetime.fromisoformat(str(record["last_updated"]).replace("Z", "+00:00")) if record["last_updated"] else None
+    return _effective_activation(record["activation"], record["decay_rate"], last, moment)
+

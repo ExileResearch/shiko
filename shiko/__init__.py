@@ -26,6 +26,7 @@ from .errors import (
     StorageError,
 )
 from .owner import OwnerManifest, read_manifest, slugify_owner
+from .pipeline import IngestionPipeline
 from .worker import Worker
 from .records import (
     Affect,
@@ -74,6 +75,7 @@ __all__ = [
     "Affect",
     "RecordError",
     "Worker",
+    "IngestionPipeline",
     # results
     "Result",
     "Status",

@@ -34,6 +34,7 @@ from .envelope import (
 )
 from .errors import EngineClosedError, ShikoError, StorageError
 from .owner import OwnerManifest, ensure_manifest, slugify_owner
+from .pipeline import IngestionPipeline
 from .queue import complete_by_kind, failed_jobs, is_pending, pending_count
 from .records import (
     Affect,
@@ -43,10 +44,18 @@ from .records import (
     RecordError,
     attach_artifact,
     create_memory,
+    effective_activation_for,
+    get_dynamics,
     get_memory,
     list_memories,
+    memory_event_rollups,
+    memory_events,
+    prune_memory_events,
+    record_memory_event,
     revise_memory,
+    set_dynamics,
 )
+from .schema_map import PROPERTY_GROUPS, schema_map
 from .results import (
     CaptureResult,
     CloseResult,
@@ -77,6 +86,10 @@ class EngineConfig:
     log_diagnostics: bool = True
     auto_archive: bool = True
     archive_dir: str | Path | None = None
+    pipeline_debounce_ms: int = 200
+    pipeline_max_delay_ms: int = 1500
+    pipeline_coalesce_at: int = 50
+    pipeline_batch_size: int = 20
 
 
 def default_root() -> Path:
@@ -129,6 +142,13 @@ class Engine:
         self._config = config
         self._closed = False
         self._archive = Archive(store, config.archive_dir or root)
+        self._pipeline = IngestionPipeline(
+            store,
+            debounce_ms=config.pipeline_debounce_ms,
+            max_delay_ms=config.pipeline_max_delay_ms,
+            coalesce_at=config.pipeline_coalesce_at,
+            batch_size=config.pipeline_batch_size,
+        )
 
     # -- construction -------------------------------------------------------
 
@@ -180,6 +200,9 @@ class Engine:
                 },
             )
         )
+        # Any session with unprocessed events gets its coalesced job back after a
+        # crash, a paused pipeline or a reopened deployment.
+        engine._pipeline.ensure_all()
         return engine
 
     # -- identity -----------------------------------------------------------
@@ -207,6 +230,10 @@ class Engine:
     @property
     def archive(self) -> Archive:
         return self._archive
+
+    @property
+    def pipeline(self) -> IngestionPipeline:
+        return self._pipeline
 
     @property
     def store(self) -> Store:
@@ -250,7 +277,9 @@ class Engine:
         if not isinstance(envelope, SourceEnvelope):
             raise TypeError("capture() expects a SourceEnvelope")
         try:
-            result = self._store.capture(envelope, job_kinds=DEFAULT_JOB_KINDS)
+            result = self._store.capture(
+                envelope, job_kinds=DEFAULT_JOB_KINDS, on_insert=self._pipeline.note_capture,
+            )
         except StorageError as exc:
             diagnostic = Diagnostic(
                 "event.write_failed", str(exc), Severity.ERROR, {"event_id": envelope.event_id}
@@ -360,7 +389,9 @@ class Engine:
         payload = source if isinstance(source, bytes) else Path(source).read_bytes()
         filename = name or (Path(source).name if not isinstance(source, bytes) else "artifact.bin")
         try:
-            result = self._store.capture(envelope, job_kinds=DEFAULT_JOB_KINDS)
+            result = self._store.capture(
+                envelope, job_kinds=DEFAULT_JOB_KINDS, on_insert=self._pipeline.note_capture,
+            )
         except StorageError as exc:
             diagnostic = Diagnostic(
                 "event.write_failed", str(exc), Severity.ERROR, {"event_id": envelope.event_id}
@@ -474,9 +505,95 @@ class Engine:
         return pending_count(self._store)
 
     def create_worker(self, **kwargs: Any) -> Worker:
-        """A worker bound to this deployment's store and archive."""
+        """A worker bound to this deployment's store, archive and pipeline."""
         self._ensure_open()
+        kwargs.setdefault("pipeline", self._pipeline)
+        kwargs.setdefault("gate", self._pipeline.can_run)
         return Worker(self._store, self._archive, **kwargs)
+
+    # -- ingestion pipeline -------------------------------------------------
+
+    def pipeline_status(self) -> dict[str, Any]:
+        self._ensure_open()
+        return self._pipeline.status()
+
+    def set_pipeline_paused(self, paused: bool) -> dict[str, Any]:
+        self._ensure_open()
+        self._pipeline.set_paused(bool(paused))
+        return self._pipeline.status()
+
+    def ingestion_state(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        self._ensure_open()
+        if session_id is None:
+            rows = self._store.read(
+                "SELECT session_id, watermark_seq, last_enqueued_seq, last_batch_at "
+                "FROM ingestion_state ORDER BY session_id"
+            )
+        else:
+            rows = self._store.read(
+                "SELECT session_id, watermark_seq, last_enqueued_seq, last_batch_at "
+                "FROM ingestion_state WHERE session_id=?",
+                (session_id,),
+            )
+        return [
+            {
+                "session_id": row[0], "watermark_seq": int(row[1]),
+                "last_enqueued_seq": int(row[2]), "last_batch_at": row[3],
+            }
+            for row in rows
+        ]
+
+    def sweep(self, *, budget_seconds: float = 2.0, max_jobs: int = 200) -> dict[str, Any]:
+        """Drain queued work in-process; the cron/systemd entry point."""
+        self._ensure_open()
+        worker = self.create_worker(worker_id="sweep")
+        summary = worker.run_until_idle(budget_seconds=budget_seconds, max_jobs=max_jobs)
+        self._diagnostics.emit(
+            Diagnostic("pipeline.sweep", "sweep drained queued work", Severity.INFO, dict(summary))
+        )
+        return summary
+
+    # -- lifecycle history and dynamics -------------------------------------
+
+    def record_memory_event(
+        self, memory_id: str, kind: str, **kwargs: Any,
+    ) -> None:
+        self._ensure_open()
+        record_memory_event(self._store, memory_id, kind, **kwargs)
+
+    def memory_events(
+        self, *, memory_id: str | None = None, kind: str | None = None, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return memory_events(self._store, memory_id=memory_id, kind=kind, limit=limit)
+
+    def prune_memory_events(self, *, retention_days: int = 30) -> dict[str, Any]:
+        self._ensure_open()
+        result = prune_memory_events(self._store, retention_days=retention_days)
+        self._diagnostics.emit(
+            Diagnostic("memory_events.pruned", "lifecycle history pruned", Severity.INFO, dict(result))
+        )
+        return result
+
+    def memory_event_rollups(self, *, memory_id: str | None = None) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return memory_event_rollups(self._store, memory_id=memory_id)
+
+    def set_dynamics(self, memory_id: str, **kwargs: Any) -> None:
+        self._ensure_open()
+        set_dynamics(self._store, memory_id, **kwargs)
+
+    def get_dynamics(self, memory_id: str) -> dict[str, Any] | None:
+        self._ensure_open()
+        return get_dynamics(self._store, memory_id)
+
+    def effective_activation(self, memory_id: str, *, at: datetime | None = None) -> float | None:
+        self._ensure_open()
+        return effective_activation_for(self._store, memory_id, at=at)
+
+    def schema_map(self) -> list[dict[str, Any]]:
+        self._ensure_open()
+        return schema_map(self._store)
 
     # -- later milestones ---------------------------------------------------
 

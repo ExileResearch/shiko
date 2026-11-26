@@ -31,7 +31,7 @@ from .envelope import SourceEnvelope
 from .errors import StorageError
 from .results import CaptureResult, Diagnostic, Severity
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_NAME = "shiko.db"
 
 # Columns every event read shares, so get_event() and list_events() cannot drift.
@@ -233,12 +233,76 @@ def _migration_2(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
-MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_1, _migration_2)
+def _migration_3(conn: sqlite3.Connection) -> None:
+    """Ingestion state, pipeline counters and bounded lifecycle history."""
+    for statement in (
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_state (
+            session_id        TEXT PRIMARY KEY,
+            watermark_seq     INTEGER NOT NULL DEFAULT 0,
+            last_enqueued_seq INTEGER NOT NULL DEFAULT 0,
+            last_batch_at     TEXT,
+            updated_at        TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_state (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        "INSERT OR IGNORE INTO pipeline_state (key, value, updated_at) VALUES ('paused', '0', '1970-01-01T00:00:00Z')",
+        "INSERT OR IGNORE INTO pipeline_state (key, value, updated_at) VALUES ('coalesced', '0', '1970-01-01T00:00:00Z')",
+        "INSERT OR IGNORE INTO pipeline_state (key, value, updated_at) VALUES ('processed_batches', '0', '1970-01-01T00:00:00Z')",
+        """
+        CREATE TABLE IF NOT EXISTS memory_events (
+            seq            INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id      TEXT NOT NULL REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            kind           TEXT NOT NULL,
+            at             TEXT NOT NULL,
+            policy_version TEXT,
+            model_id       TEXT,
+            detail_json    TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS memory_events_memory ON memory_events (memory_id, at)",
+        "CREATE INDEX IF NOT EXISTS memory_events_at ON memory_events (at)",
+        """
+        CREATE TABLE IF NOT EXISTS memory_event_rollups (
+            day       TEXT NOT NULL,
+            memory_id TEXT NOT NULL,
+            kind      TEXT NOT NULL,
+            count     INTEGER NOT NULL,
+            PRIMARY KEY (day, memory_id, kind)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memory_dynamics (
+            memory_id          TEXT PRIMARY KEY REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            activation         REAL,
+            baseline_activation REAL,
+            storage_strength   REAL,
+            retrieval_strength REAL,
+            reinforcement      REAL,
+            decay_rate         REAL,
+            last_updated       TEXT,
+            updated_at         TEXT NOT NULL
+        )
+        """,
+        """
+        INSERT OR IGNORE INTO ingestion_state (session_id, watermark_seq, last_enqueued_seq, updated_at)
+        SELECT session_id, 0, 0, '1970-01-01T00:00:00Z' FROM source_events GROUP BY session_id
+        """,
+    ):
+        conn.execute(statement)
+
+
+MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_1, _migration_2, _migration_3)
 
 
 class Store:
     """One deployment's canonical database."""
-
     def __init__(
         self,
         path: str | Path,
@@ -408,7 +472,13 @@ class Store:
             ),
         )
 
-    def capture(self, envelope: SourceEnvelope, *, job_kinds: tuple[str, ...] = ()) -> CaptureResult:
+    def capture(
+        self,
+        envelope: SourceEnvelope,
+        *,
+        job_kinds: tuple[str, ...] = (),
+        on_insert: Callable[[sqlite3.Connection, SourceEnvelope, int], None] | None = None,
+    ) -> CaptureResult:
         """Insert one event (and its follow-up jobs) in a single transaction."""
         sha = envelope.content_sha256()
         result: CaptureResult | None = None
@@ -429,6 +499,8 @@ class Store:
 
                     for kind in job_kinds:
                         enqueue(conn, kind, envelope.event_id)
+                if on_insert is not None:
+                    on_insert(conn, envelope, seq)
         if result is not None:
             return result
         diagnostics: tuple[Diagnostic, ...] = ()
