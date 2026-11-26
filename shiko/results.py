@@ -137,23 +137,41 @@ class OpenResult(Result):
 @dataclass(frozen=True)
 class CaptureResult(Result):
     event_id: str = ""
+    capture_seq: int = 0
     stored: bool = False
     duplicate: bool = False
     conflict: bool = False
+    archived: bool = False
 
     @classmethod
     def success(
-        cls, event_id: str, *, duplicate: bool = False, conflict: bool = False,
-        diagnostics: tuple[Diagnostic, ...] = (),
+        cls, event_id: str, *, capture_seq: int = 0, duplicate: bool = False, conflict: bool = False,
+        archived: bool = False, diagnostics: tuple[Diagnostic, ...] = (),
     ) -> "CaptureResult":
         return cls(
             operation="capture",
             status=Status.OK,
             diagnostics=diagnostics,
             event_id=event_id,
+            capture_seq=capture_seq,
             stored=not duplicate,
             duplicate=duplicate,
             conflict=conflict,
+            archived=archived,
+        )
+
+    @classmethod
+    def with_archive_failure(
+        cls, event_id: str, *, capture_seq: int, diagnostics: tuple[Diagnostic, ...],
+    ) -> "CaptureResult":
+        return cls(
+            operation="capture",
+            status=Status.DEGRADED,
+            diagnostics=diagnostics,
+            event_id=event_id,
+            capture_seq=capture_seq,
+            stored=True,
+            archived=False,
         )
 
     @classmethod
@@ -163,9 +181,11 @@ class CaptureResult(Result):
     def payload(self) -> dict[str, Any]:
         return {
             "event_id": self.event_id,
+            "capture_seq": self.capture_seq,
             "stored": self.stored,
             "duplicate": self.duplicate,
             "conflict": self.conflict,
+            "archived": self.archived,
         }
 
 

@@ -26,6 +26,14 @@ from .errors import (
     StorageError,
 )
 from .owner import OwnerManifest, read_manifest, slugify_owner
+from .worker import Worker
+from .records import (
+    Affect,
+    ClassificationInput,
+    EvidenceInput,
+    MemoryDraft,
+    RecordError,
+)
 from .results import (
     CaptureResult,
     CloseResult,
@@ -59,6 +67,13 @@ __all__ = [
     "OwnerManifest",
     "read_manifest",
     "slugify_owner",
+    # canonical records
+    "MemoryDraft",
+    "EvidenceInput",
+    "ClassificationInput",
+    "Affect",
+    "RecordError",
+    "Worker",
     # results
     "Result",
     "Status",

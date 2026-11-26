@@ -1,17 +1,19 @@
-"""Canonical SQLite storage.
+"""Canonical SQLite storage with versioned migrations.
 
-Milestone 1 stores the evidence layer only: one row per accepted source event,
-keyed by ``event_id`` within the owning deployment. Later milestones extend this
-schema through :data:`MIGRATIONS`; the migration runner and version check exist
-now so a store written by a newer build is refused instead of corrupted.
+Schema 1 stored one row per accepted source event. Schema 2 adds the canonical
+layer — memories, revisions, evidence links, classifications, entity references,
+optional property groups, artifacts, a durable work queue and archive
+checkpoints — plus a per-store capture sequence that gives every reader a single
+committed boundary.
 
-Durability rules already in force:
+Rules that hold across versions:
 
-* WAL journal, ``synchronous=NORMAL`` and a busy timeout, so a reader and the
-  capture thread can share the file.
-* One transaction per event; absence of an error means the row is committed.
-* A reused event ID is never overwritten. Same content is an idempotent
-  duplicate; different content is a visible conflict.
+* One transaction per logical write; an acknowledged capture is committed.
+* Migrations run inside ``BEGIN IMMEDIATE``. SQLite DDL is transactional, so an
+  interrupted migration leaves the previous schema intact and can be retried.
+* A reused event ID is never overwritten: identical content is an idempotent
+  duplicate, different content is a visible conflict.
+* Optional properties use SQL ``NULL`` for "unknown". ``0.0`` is a measurement.
 """
 
 from __future__ import annotations
@@ -19,87 +21,237 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .envelope import SourceEnvelope
 from .errors import StorageError
 from .results import CaptureResult, Diagnostic, Severity
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_NAME = "shiko.db"
 
-# Columns every read shape shares, so get_event() and list_events() cannot drift.
+# Columns every event read shares, so get_event() and list_events() cannot drift.
 EVENT_FIELDS = (
-    "event_id", "owner_id", "actor_id", "actor_kind", "actor_name", "session_id",
-    "delegation_parent", "observed_at", "received_at", "visibility", "source_kind",
-    "source_id", "subjects_json", "content", "content_type", "metadata_json",
-    "content_sha256", "captured_at",
+    "event_id", "capture_seq", "owner_id", "actor_id", "actor_kind", "actor_name",
+    "session_id", "delegation_parent", "observed_at", "received_at", "visibility",
+    "source_kind", "source_id", "subjects_json", "content", "content_type",
+    "metadata_json", "content_sha256", "captured_at",
 )
 _EVENT_COLUMNS = ", ".join(EVENT_FIELDS)
 
 
-_MIGRATION_1_STATEMENTS = (
-    """
-    CREATE TABLE IF NOT EXISTS meta (
-        key   TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS source_events (
-        event_id          TEXT PRIMARY KEY,
-        owner_id          TEXT NOT NULL,
-        actor_id          TEXT NOT NULL,
-        actor_kind        TEXT NOT NULL,
-        actor_name        TEXT NOT NULL DEFAULT '',
-        session_id        TEXT NOT NULL,
-        delegation_parent TEXT,
-        observed_at       TEXT NOT NULL,
-        received_at       TEXT NOT NULL,
-        visibility        TEXT NOT NULL,
-        source_kind       TEXT NOT NULL,
-        source_id         TEXT NOT NULL DEFAULT '',
-        source_json       TEXT NOT NULL,
-        content           TEXT NOT NULL,
-        content_type      TEXT NOT NULL,
-        subjects_json     TEXT NOT NULL,
-        metadata_json     TEXT NOT NULL,
-        content_sha256    TEXT NOT NULL,
-        captured_at       TEXT NOT NULL
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS source_events_session
-        ON source_events (session_id, observed_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS source_events_actor
-        ON source_events (actor_id, observed_at)
-    """,
-)
-
-
 def _migration_1(conn: sqlite3.Connection) -> None:
-    # executescript() would implicitly COMMIT the migration transaction, so each
-    # statement runs through execute() inside the caller's BEGIN IMMEDIATE.
-    for statement in _MIGRATION_1_STATEMENTS:
+    """Evidence layer (schema 1)."""
+    for statement in (
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version    INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL,
+            checksum   TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS source_events (
+            event_id          TEXT PRIMARY KEY,
+            owner_id          TEXT NOT NULL,
+            actor_id          TEXT NOT NULL,
+            actor_kind        TEXT NOT NULL,
+            actor_name        TEXT NOT NULL DEFAULT '',
+            session_id        TEXT NOT NULL,
+            delegation_parent TEXT,
+            observed_at       TEXT NOT NULL,
+            received_at       TEXT NOT NULL,
+            visibility        TEXT NOT NULL,
+            source_kind       TEXT NOT NULL,
+            source_id         TEXT NOT NULL DEFAULT '',
+            source_json       TEXT NOT NULL,
+            content           TEXT NOT NULL,
+            content_type      TEXT NOT NULL,
+            subjects_json     TEXT NOT NULL,
+            metadata_json     TEXT NOT NULL,
+            content_sha256    TEXT NOT NULL,
+            captured_at       TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS source_events_session ON source_events (session_id, observed_at)",
+        "CREATE INDEX IF NOT EXISTS source_events_actor ON source_events (actor_id, observed_at)",
+    ):
         conn.execute(statement)
 
 
-MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_1,)
+def _migration_2(conn: sqlite3.Connection) -> None:
+    """Canonical records, revisions, provenance, artifacts and work queue."""
+    for statement in (
+        "ALTER TABLE source_events ADD COLUMN capture_seq INTEGER",
+        "UPDATE source_events SET capture_seq = rowid WHERE capture_seq IS NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS source_events_capture_seq ON source_events (capture_seq)",
+        """
+        CREATE TABLE IF NOT EXISTS canonical_memories (
+            memory_id        TEXT PRIMARY KEY,
+            owner_id         TEXT NOT NULL,
+            kind             TEXT NOT NULL,
+            subject_kind     TEXT,
+            subject_id       TEXT,
+            status           TEXT NOT NULL,
+            current_revision INTEGER NOT NULL DEFAULT 1,
+            created_at       TEXT NOT NULL,
+            learned_at       TEXT NOT NULL,
+            metadata_json    TEXT NOT NULL DEFAULT '{}'
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memory_revisions (
+            memory_id       TEXT NOT NULL REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            revision        INTEGER NOT NULL,
+            content         TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            event_time      TEXT,
+            valid_from      TEXT,
+            valid_to        TEXT,
+            learned_at      TEXT NOT NULL,
+            policy_version  TEXT NOT NULL,
+            source_event_id TEXT,
+            created_at      TEXT NOT NULL,
+            PRIMARY KEY (memory_id, revision)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS evidence_links (
+            link_id           TEXT PRIMARY KEY,
+            memory_id         TEXT NOT NULL REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            event_id          TEXT NOT NULL,
+            role              TEXT NOT NULL,
+            span_start        INTEGER,
+            span_end          INTEGER,
+            independence_root TEXT NOT NULL,
+            created_at        TEXT NOT NULL,
+            UNIQUE (memory_id, event_id, role)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS evidence_links_event ON evidence_links (event_id)",
+        """
+        CREATE TABLE IF NOT EXISTS classifications (
+            classification_id TEXT PRIMARY KEY,
+            memory_id         TEXT NOT NULL REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            axis              TEXT NOT NULL,
+            value             TEXT NOT NULL,
+            confidence        REAL,
+            method            TEXT NOT NULL,
+            model_id          TEXT,
+            created_at        TEXT NOT NULL,
+            UNIQUE (memory_id, axis, value, method)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS entity_refs (
+            entity_ref_id TEXT PRIMARY KEY,
+            entity_id     TEXT NOT NULL,
+            entity_kind   TEXT NOT NULL,
+            display_name  TEXT NOT NULL DEFAULT '',
+            event_id      TEXT,
+            memory_id     TEXT,
+            created_at    TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memory_affect (
+            memory_id  TEXT PRIMARY KEY REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            valence    REAL,
+            arousal    REAL,
+            dominance  REAL,
+            confidence REAL,
+            source     TEXT NOT NULL,
+            model_id   TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS memory_temporal (
+            memory_id        TEXT PRIMARY KEY REFERENCES canonical_memories(memory_id) ON DELETE CASCADE,
+            event_time       TEXT,
+            valid_from       TEXT,
+            valid_to         TEXT,
+            time_granularity TEXT NOT NULL DEFAULT 'unknown',
+            updated_at       TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            event_id    TEXT NOT NULL,
+            uri         TEXT NOT NULL,
+            media_type  TEXT NOT NULL,
+            size_bytes  INTEGER NOT NULL,
+            sha256      TEXT NOT NULL,
+            created_at  TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS artifacts_event ON artifacts (event_id)",
+        """
+        CREATE TABLE IF NOT EXISTS pending_work (
+            job_id        TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            event_id      TEXT,
+            payload_json  TEXT NOT NULL DEFAULT '{}',
+            state         TEXT NOT NULL,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            max_attempts  INTEGER NOT NULL DEFAULT 3,
+            not_before    TEXT NOT NULL,
+            lease_owner   TEXT,
+            lease_expires TEXT,
+            last_error    TEXT,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            UNIQUE (kind, event_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS pending_work_ready ON pending_work (state, not_before)",
+        """
+        CREATE TABLE IF NOT EXISTS archive_streams (
+            stream           TEXT PRIMARY KEY,
+            path             TEXT NOT NULL,
+            byte_length      INTEGER NOT NULL DEFAULT 0,
+            last_capture_seq INTEGER NOT NULL DEFAULT 0,
+            updated_at       TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS index_state (
+            name            TEXT PRIMARY KEY,
+            indexed_through INTEGER NOT NULL DEFAULT 0,
+            updated_at      TEXT NOT NULL
+        )
+        """,
+        "INSERT OR IGNORE INTO index_state (name, indexed_through, updated_at) "
+        "VALUES ('events', 0, '1970-01-01T00:00:00Z')",
+    ):
+        conn.execute(statement)
+
+
+MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (_migration_1, _migration_2)
 
 
 class Store:
     """One deployment's canonical database."""
 
-    def __init__(self, path: str | Path, owner_id: str) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        owner_id: str,
+        *,
+        migrations: tuple[Callable[[sqlite3.Connection], None], ...] = MIGRATIONS,
+    ) -> None:
         self.path = Path(path)
         self.owner_id = owner_id
         self._conn: sqlite3.Connection | None = None
         self._lock = threading.RLock()
         self.schema_version = 0
+        self._migrations = migrations
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -107,7 +259,7 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             conn = sqlite3.connect(
-                str(self.path), timeout=5.0, isolation_level=None, check_same_thread=False
+                str(self.path), timeout=10.0, isolation_level=None, check_same_thread=False
             )
         except sqlite3.Error as exc:
             raise StorageError(f"cannot open store: {exc}", detail={"path": str(self.path)}) from exc
@@ -116,7 +268,7 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA busy_timeout=10000")
             self.schema_version = self._migrate()
         except sqlite3.Error as exc:
             self.close()
@@ -141,6 +293,36 @@ class Store:
             raise StorageError("store is closed", detail={"path": str(self.path)})
         return self._conn
 
+    # -- transactions -------------------------------------------------------
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction. Any exception rolls the whole unit back."""
+        conn = self._connection()
+        with self._lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as exc:
+                raise StorageError(f"cannot begin transaction: {exc}") from exc
+            try:
+                yield conn
+                conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def read(self, query: str, params: tuple[Any, ...] = ()) -> list[tuple]:
+        with self._lock:
+            return self._connection().execute(query, params).fetchall()
+
+    def read_one(self, query: str, params: tuple[Any, ...] = ()) -> tuple | None:
+        with self._lock:
+            return self._connection().execute(query, params).fetchone()
+
     # -- schema -------------------------------------------------------------
 
     def _migrate(self) -> int:
@@ -152,15 +334,24 @@ class Store:
                 detail={"path": str(self.path), "store_schema": current, "supported": SCHEMA_VERSION},
             )
         for target in range(current + 1, SCHEMA_VERSION + 1):
-            migration = MIGRATIONS[target - 1]
+            migration = self._migrations[target - 1]
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 migration(conn)
                 self._write_schema_version(conn, target)
+                conn.execute(
+                    "INSERT OR REPLACE INTO schema_migrations (version, applied_at, checksum) VALUES (?, ?, ?)",
+                    (target, _now(), f"{target}:{migration.__name__}"),
+                )
                 conn.execute("COMMIT")
-            except sqlite3.Error as exc:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
+            except BaseException as exc:
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                if isinstance(exc, StorageError):
+                    raise
                 raise StorageError(
                     f"migration to schema {target} failed: {exc}",
                     detail={"path": str(self.path), "from_schema": target - 1},
@@ -190,64 +381,56 @@ class Store:
             (str(version),),
         )
 
-    # -- writes -------------------------------------------------------------
+    # -- events -------------------------------------------------------------
 
-    def capture(self, envelope: SourceEnvelope) -> CaptureResult:
-        """Insert one event. Idempotent for identical content; loud for conflicts."""
-        conn = self._connection()
+    def next_capture_seq(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT COALESCE(MAX(capture_seq), 0) FROM source_events").fetchone()
+        return int(row[0]) + 1
+
+    def insert_event(self, conn: sqlite3.Connection, envelope: SourceEnvelope, capture_seq: int) -> None:
+        conn.execute(
+            """
+            INSERT INTO source_events (
+                event_id, capture_seq, owner_id, actor_id, actor_kind, actor_name, session_id,
+                delegation_parent, observed_at, received_at, visibility,
+                source_kind, source_id, source_json, content, content_type,
+                subjects_json, metadata_json, content_sha256, captured_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                envelope.event_id, capture_seq, self.owner_id, envelope.actor.id,
+                envelope.actor.kind.value, envelope.actor.display_name, envelope.session_id,
+                envelope.delegation_parent, _iso(envelope.observed_at), _iso(envelope.received_at),
+                envelope.visibility.value, envelope.source.kind, envelope.source.id,
+                _json(envelope.source.to_dict()), envelope.content, envelope.content_type,
+                _json([s.to_dict() for s in envelope.subjects]), _json(dict(envelope.metadata)),
+                envelope.content_sha256(), _now(),
+            ),
+        )
+
+    def capture(self, envelope: SourceEnvelope, *, job_kinds: tuple[str, ...] = ()) -> CaptureResult:
+        """Insert one event (and its follow-up jobs) in a single transaction."""
         sha = envelope.content_sha256()
-        with self._lock:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                row = conn.execute(
-                    "SELECT owner_id, content_sha256 FROM source_events WHERE event_id=?",
-                    (envelope.event_id,),
-                ).fetchone()
-                if row is not None:
-                    conn.execute("COMMIT")
-                    return self._duplicate_result(envelope, row[1], sha)
-                conn.execute(
-                    """
-                    INSERT INTO source_events (
-                        event_id, owner_id, actor_id, actor_kind, actor_name, session_id,
-                        delegation_parent, observed_at, received_at, visibility,
-                        source_kind, source_id, source_json, content, content_type,
-                        subjects_json, metadata_json, content_sha256, captured_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        envelope.event_id,
-                        self.owner_id,
-                        envelope.actor.id,
-                        envelope.actor.kind.value,
-                        envelope.actor.display_name,
-                        envelope.session_id,
-                        envelope.delegation_parent,
-                        _iso(envelope.observed_at),
-                        _iso(envelope.received_at),
-                        envelope.visibility.value,
-                        envelope.source.kind,
-                        envelope.source.id,
-                        _json(envelope.source.to_dict()),
-                        envelope.content,
-                        envelope.content_type,
-                        _json([s.to_dict() for s in envelope.subjects]),
-                        _json(dict(envelope.metadata)),
-                        sha,
-                        _iso(datetime.now(timezone.utc)),
-                    ),
-                )
-                conn.execute("COMMIT")
-            except sqlite3.Error as exc:
-                try:
-                    if conn.in_transaction:
-                        conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                return CaptureResult.failure(
-                    envelope.event_id,
-                    (Diagnostic("event.write_failed", str(exc), Severity.ERROR, {"event_id": envelope.event_id}),),
-                )
+        result: CaptureResult | None = None
+        seq = 0
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT content_sha256, capture_seq FROM source_events WHERE event_id=?",
+                (envelope.event_id,),
+            ).fetchone()
+            if row is not None:
+                seq = int(row[1] or 0)
+                result = self._duplicate_result(envelope, row[0], sha, seq)
+            else:
+                seq = self.next_capture_seq(conn)
+                self.insert_event(conn, envelope, seq)
+                if job_kinds:
+                    from .queue import enqueue
+
+                    for kind in job_kinds:
+                        enqueue(conn, kind, envelope.event_id)
+        if result is not None:
+            return result
         diagnostics: tuple[Diagnostic, ...] = ()
         if envelope.clock_skew_seconds > 0:
             diagnostics = (
@@ -258,12 +441,15 @@ class Store:
                     {"event_id": envelope.event_id, "skew_seconds": envelope.clock_skew_seconds},
                 ),
             )
-        return CaptureResult.success(envelope.event_id, diagnostics=diagnostics)
+        return CaptureResult.success(envelope.event_id, capture_seq=seq, diagnostics=diagnostics)
 
-    def _duplicate_result(self, envelope: SourceEnvelope, stored_sha: str, sha: str) -> CaptureResult:
+    def _duplicate_result(
+        self, envelope: SourceEnvelope, stored_sha: str, sha: str, capture_seq: int
+    ) -> CaptureResult:
         if stored_sha != sha:
             return CaptureResult.success(
                 envelope.event_id,
+                capture_seq=capture_seq,
                 duplicate=True,
                 conflict=True,
                 diagnostics=(
@@ -281,6 +467,7 @@ class Store:
             )
         return CaptureResult.success(
             envelope.event_id,
+            capture_seq=capture_seq,
             duplicate=True,
             diagnostics=(
                 Diagnostic(
@@ -292,50 +479,96 @@ class Store:
             ),
         )
 
+    def event_sha(self, event_id: str) -> str | None:
+        row = self.read_one("SELECT content_sha256 FROM source_events WHERE event_id=?", (event_id,))
+        return str(row[0]) if row else None
+
     # -- reads --------------------------------------------------------------
 
     def count_events(self) -> int:
-        conn = self._connection()
-        with self._lock:
-            return int(conn.execute("SELECT COUNT(*) FROM source_events").fetchone()[0])
+        return int(self.read_one("SELECT COUNT(*) FROM source_events")[0])
 
     def count_events_for_session(self, session_id: str) -> int:
-        conn = self._connection()
-        with self._lock:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM source_events WHERE session_id=?", (session_id,)
-            ).fetchone()
-            return int(row[0])
+        row = self.read_one("SELECT COUNT(*) FROM source_events WHERE session_id=?", (session_id,))
+        return int(row[0]) if row else 0
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
-        conn = self._connection()
-        with self._lock:
-            row = conn.execute(
-                f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE event_id=?",
-                (event_id,),
-            ).fetchone()
+        row = self.read_one(f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE event_id=?", (event_id,))
         return dict(zip(EVENT_FIELDS, row)) if row is not None else None
 
     def list_events(self, *, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        conn = self._connection()
-        with self._lock:
-            if session_id is None:
-                rows = conn.execute(
-                    f"SELECT {_EVENT_COLUMNS} FROM source_events ORDER BY observed_at, event_id LIMIT ?",
-                    (int(limit),),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE session_id=? "
-                    "ORDER BY observed_at, event_id LIMIT ?",
-                    (session_id, int(limit)),
-                ).fetchall()
+        if session_id is None:
+            rows = self.read(
+                f"SELECT {_EVENT_COLUMNS} FROM source_events ORDER BY capture_seq LIMIT ?", (int(limit),)
+            )
+        else:
+            rows = self.read(
+                f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE session_id=? "
+                "ORDER BY capture_seq LIMIT ?",
+                (session_id, int(limit)),
+            )
         return [dict(zip(EVENT_FIELDS, row)) for row in rows]
 
+    def events_after(self, capture_seq: int, *, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.read(
+            f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE capture_seq > ? "
+            "ORDER BY capture_seq LIMIT ?",
+            (int(capture_seq), int(limit)),
+        )
+        return [dict(zip(EVENT_FIELDS, row)) for row in rows]
+
+    def recent_events_for_session(
+        self, session_id: str, *, exclude_event_id: str | None = None, limit: int = 6
+    ) -> list[dict[str, Any]]:
+        rows = self.read(
+            f"SELECT {_EVENT_COLUMNS} FROM source_events WHERE session_id=? AND event_id IS NOT ? "
+            "ORDER BY capture_seq DESC LIMIT ?",
+            (session_id, exclude_event_id, int(limit)),
+        )
+        return [dict(zip(EVENT_FIELDS, row)) for row in reversed(rows)]
+
     def integrity_check(self) -> str:
-        conn = self._connection()
-        with self._lock:
-            return str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+        return str(self.read_one("PRAGMA integrity_check")[0])
+
+    # -- archive streams ----------------------------------------------------
+
+    def stream_state(self, stream: str) -> dict[str, Any] | None:
+        row = self.read_one(
+            "SELECT stream, path, byte_length, last_capture_seq FROM archive_streams WHERE stream=?",
+            (stream,),
+        )
+        if row is None:
+            return None
+        return {
+            "stream": row[0], "path": row[1], "byte_length": int(row[2]), "last_capture_seq": int(row[3])
+        }
+
+    def update_stream(
+        self, conn: sqlite3.Connection, stream: str, *, path: str, byte_length: int, last_capture_seq: int
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO archive_streams (stream, path, byte_length, last_capture_seq, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(stream) DO UPDATE SET
+                path=excluded.path, byte_length=excluded.byte_length,
+                last_capture_seq=excluded.last_capture_seq, updated_at=excluded.updated_at
+            """,
+            (stream, path, int(byte_length), int(last_capture_seq), _now()),
+        )
+
+    # -- index boundary -----------------------------------------------------
+
+    def indexed_through(self) -> int:
+        row = self.read_one("SELECT indexed_through FROM index_state WHERE name='events'")
+        return int(row[0]) if row else 0
+
+    def set_indexed_through(self, conn: sqlite3.Connection, value: int) -> None:
+        conn.execute(
+            "INSERT INTO index_state (name, indexed_through, updated_at) VALUES ('events', ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET indexed_through=excluded.indexed_through, updated_at=excluded.updated_at",
+            (int(value), _now()),
+        )
 
 
 def _json(value: Any) -> str:
@@ -344,3 +577,11 @@ def _json(value: Any) -> str:
 
 def _iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _now() -> str:
+    return _iso(datetime.now(timezone.utc))
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
