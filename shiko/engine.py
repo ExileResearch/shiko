@@ -41,6 +41,8 @@ from .extraction import (
     GenerativeExtractor,
     Rejection,
     StructuredExtractor,
+    locate_quote,
+    negation_gaps,
     validate_candidate,
 )
 from .owner import OwnerManifest, ensure_manifest, slugify_owner
@@ -477,11 +479,56 @@ class Engine:
         accepted: list[str] = []
         rejected: list[Rejection] = list(outcome.rejected)
         model_id = (outcome.detail or {}).get("model_id") or _model_id(active)
-        for candidate in outcome.candidates:
-            reason = validate_candidate(event, candidate, artifacts=artifacts)
-            if reason is not None:
-                rejected.append(Rejection(candidate.content, reason))
-                continue
+
+        def prepare(items: Any) -> list[Candidate]:
+            ready: list[Candidate] = []
+            for candidate in items:
+                reason = validate_candidate(event, candidate, artifacts=artifacts)
+                if reason is not None:
+                    rejected.append(Rejection(candidate.content, reason))
+                    continue
+                if candidate.quote:
+                    located = locate_quote(str(event.get("content") or ""), candidate.quote)
+                    if located is not None:
+                        candidate = replace(candidate, span=located)
+                ready.append(candidate)
+            return ready
+
+        prepared = prepare(outcome.candidates)
+        gaps_before = negation_gaps(event, prepared)
+        repair_calls = 0
+        repair_error: str | None = None
+        if gaps_before and hasattr(active, "repair"):
+            try:
+                repaired = active.repair(event, gaps_before)  # type: ignore[attr-defined]
+            except Exception as exc:  # repair is best-effort; the gap stays visible
+                repair_error = f"{type(exc).__name__}: {exc}"
+            else:
+                repair_calls = 1
+                rejected.extend(repaired.rejected)
+                prepared.extend(prepare(repaired.candidates))
+                unique: list[Candidate] = []
+                keys: set[tuple[str, tuple[int, int] | None]] = set()
+                for candidate in prepared:
+                    key = (candidate.content_sha256(), candidate.span)
+                    if key in keys:
+                        continue
+                    keys.add(key)
+                    unique.append(candidate)
+                prepared = unique
+
+        gaps_after = negation_gaps(event, prepared)
+        if gaps_after:
+            for gap in gaps_after:
+                rejected.append(Rejection(gap["quote"], "negation_uncovered", {"cue": gap["cue"]}))
+            self._diagnostics.emit(Diagnostic(
+                "extraction.negation_uncovered",
+                "some denials or doubts were not covered by a negated claim",
+                Severity.WARNING,
+                {"event_id": event_id, "gaps": [gap["quote"] for gap in gaps_after]},
+            ))
+
+        for candidate in prepared:
             duplicate = self._store.read_one(
                 "SELECT memory_id FROM extraction_candidates WHERE event_id=? AND extractor_version=? "
                 "AND content_sha256=? AND span_start IS ? AND span_end IS ? AND status='accepted'",
@@ -534,7 +581,14 @@ class Engine:
             )
 
         detail = dict(outcome.detail or {})
-        detail.update({"accepted": len(accepted), "rejected": len(rejected)})
+        detail.update({
+            "accepted": len(accepted), "rejected": len(rejected),
+            "repair_calls": repair_calls,
+            "negation_gaps_before": len(gaps_before),
+            "negation_gaps_after": len(gaps_after),
+        })
+        if repair_error:
+            detail["repair_error"] = repair_error
         with self._store.transaction() as conn:
             conn.execute(
                 """

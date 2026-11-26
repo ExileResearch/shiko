@@ -77,6 +77,7 @@ def _claims() -> list[dict]:
     return [
         {
             "content": "The NEMA17 will not be strong enough.",
+            "quote": "I don't think the NEMA17 will be strong enough.",
             "kind": "semantic", "epistemic": "belief", "modality": "text", "scope": "internal",
             "subject": {"kind": "device", "id": "nema17"},
             "span": _span("I don't think the NEMA17 will be strong enough."),
@@ -84,6 +85,7 @@ def _claims() -> list[dict]:
         },
         {
             "content": "The NEMA17 is fine.",
+            "quote": "the NEMA17 is fine",
             "kind": "semantic", "epistemic": "reported", "modality": "text", "scope": "user",
             "subject": {"kind": "person", "id": "robin"},
             "span": _span("the NEMA17 is fine"),
@@ -91,20 +93,23 @@ def _claims() -> list[dict]:
         },
         {
             "content": "We proposed the M2000.",
+            "quote": "We proposed the M2000",
             "kind": "semantic", "epistemic": "hypothesis", "modality": "text", "scope": "shared",
             "subject": {"kind": "device", "id": "m2000"},
             "span": _span("We proposed the M2000"), "confidence": 0.8,
         },
         {
             "content": "The 7020 currently has a GTX 960.",
+            "quote": "the 7020 currently has a GTX 960",
             "kind": "semantic", "epistemic": "fact", "modality": "text", "scope": "shared",
             "subject": {"kind": "device", "id": "7020"},
             "span": _span("the 7020 currently has a GTX 960"), "confidence": 0.95,
         },
         {
-            "content": "This span is deliberately outside the source.",
+            "content": "The camera is heavy.",
+            "quote": "The camera is heavy",
             "kind": "semantic", "epistemic": "fact", "modality": "text", "scope": "internal",
-            "span": [9999, 10050],
+            "span": [0, 18],
         },
     ]
 
@@ -129,7 +134,7 @@ def test_candidate_extraction(tmp_path):
 
     assert result.status == "succeeded"
     assert len(result.accepted) == 4
-    assert [item.reason for item in result.rejected] == ["span_out_of_range"]
+    assert [item.reason for item in result.rejected] == ["quote_not_in_source"]
     assert backend.calls == 1
 
     memories = engine.memories()
@@ -196,6 +201,77 @@ def test_candidate_extraction(tmp_path):
     assert timed_out.status == "failed"
     assert timed_out.diagnostics[0].code == "extraction.failed"
 
+    # The polarity check rejects both observed live failures: a denial restated
+    # as an assertion, and a quote the model invented.
+    guard_event = _capture(
+        engine, "I don't think the NEMA17 will hold. The camera is light.",
+        event_id="turn-4",
+    )
+    guarded = GenerativeExtractor(RecordedBackend([json.dumps([
+        {
+            "content": "The NEMA17 will hold.",
+            "quote": "I don't think the NEMA17 will hold",
+            "kind": "semantic", "epistemic": "belief", "span": [0, 36], "negated": False,
+        },
+        {
+            "content": "The camera is heavy.",
+            "quote": "The camera is heavy",
+            "kind": "semantic", "epistemic": "fact", "span": [0, 21],
+        },
+    ])]), timeout=5)
+    guarded_result = engine.extract_event(guard_event.event_id, extractor=guarded)
+    assert guarded_result.status == "succeeded"
+    assert guarded_result.accepted == ()
+    assert {item.reason for item in guarded_result.rejected} == {
+        "negation_not_marked", "quote_not_in_source", "negation_uncovered",
+    }
+    assert len(engine.memories()) == 4
+
+    # A model that drops the denial entirely gets one targeted repair pass.
+    repair_event = _capture(
+        engine, "I doubt the NEMA17 will hold. The camera is light.", event_id="turn-5",
+    )
+    repair_backend = RecordedBackend([
+        json.dumps([{
+            "content": "The camera is light.", "quote": "The camera is light.",
+            "kind": "semantic", "epistemic": "observation", "span": [37, 57],
+        }]),
+        json.dumps([{
+            "content": "The NEMA17 may not hold.", "quote": "I doubt the NEMA17 will hold",
+            "kind": "semantic", "epistemic": "belief", "subject": {"kind": "device", "id": "nema17"},
+            "span": [0, 28], "negated": True,
+        }]),
+    ])
+    repaired = engine.extract_event(
+        repair_event.event_id, extractor=GenerativeExtractor(repair_backend, timeout=5)
+    )
+    assert repaired.status == "succeeded"
+    assert len(repaired.accepted) == 2
+    assert repair_backend.calls == 2
+    run_detail = engine.extraction_runs(event_id=repair_event.event_id)[0]["detail"]
+    assert run_detail["repair_calls"] == 1
+    assert run_detail["negation_gaps_before"] == 1
+    assert run_detail["negation_gaps_after"] == 0
+
+    # If the repair also misses it, the gap is recorded and visible.
+    unresolved_event = _capture(
+        engine, "I doubt the NEMA17 will hold.", event_id="turn-6",
+    )
+    unresolved_backend = RecordedBackend([
+        json.dumps([]),
+        json.dumps([{
+            "content": "The NEMA17 is fine.", "quote": "the NEMA17 is fine",
+            "kind": "semantic", "epistemic": "reported", "span": [0, 20],
+        }]),
+    ])
+    unresolved = engine.extract_event(
+        unresolved_event.event_id, extractor=GenerativeExtractor(unresolved_backend, timeout=5)
+    )
+    assert unresolved.status == "succeeded"
+    assert any(item.reason == "negation_uncovered" for item in unresolved.rejected)
+    diagnostics = [item.code for item in engine.diagnostics.recent()]
+    assert "extraction.negation_uncovered" in diagnostics
+
     # Typed tool events extract without a model at all.
     tool_event = _capture(
         engine, "scale reports 82 g", event_id="tool-1", source_kind="tool.reading",
@@ -241,7 +317,10 @@ def test_candidate_extraction(tmp_path):
         event_id="live-1",
     )
     live = live_engine.extract_event(
-        live_event.event_id, extractor=GenerativeExtractor(backend, timeout=90)
+        live_event.event_id,
+        extractor=GenerativeExtractor(
+            backend, timeout=float(os.environ.get("SHIKO_LLM_TIMEOUT", "180"))
+        ),
     )
     assert live.status == "succeeded", live.to_dict()
     assert live.calls == 1
